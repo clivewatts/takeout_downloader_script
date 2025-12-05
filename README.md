@@ -57,59 +57,83 @@ FILE_COUNT=100
 PARALLEL_DOWNLOADS=6
 ```
 
-## Getting the Initial URL
+## Getting the Initial Download URL
 
-The `TAKEOUT_URL` in your `.env` file is the download link for the **first file** in your Google Takeout export. This URL contains:
+### What is this and why do we need it?
 
-- **File pattern**: `takeout-20251204T101148Z-3-001.zip` - The script increments the `001` part to download `002`, `003`, etc.
-- **Authentication tokens**: Query parameters like `j=`, `i=`, `user=` that identify your export
-- **Session info**: The `authuser=` parameter for multi-account users
+When you create a Google Takeout export, Google splits your data into multiple 2GB ZIP files. A large account might have **hundreds of files** like:
 
-### Why It's Needed
+```
+takeout-20251204T101148Z-3-001.zip
+takeout-20251204T101148Z-3-002.zip
+takeout-20251204T101148Z-3-003.zip
+...
+takeout-20251204T101148Z-3-730.zip
+```
 
-Google Takeout splits large exports into multiple 2GB ZIP files (e.g., 730 files for a large account). Instead of manually clicking each download link, you provide the first URL and the script automatically constructs URLs for all subsequent files.
+Google doesn't provide a "download all" button - you'd have to click each file individually. This script solves that by **extrapolating all the download URLs from just the first one**.
 
-### How to Get the URL
+### How URL Extrapolation Works
 
-#### Chrome / Chromium / Edge
+You provide the URL for file `001`, and the script automatically generates URLs for `002`, `003`, etc. by incrementing the file number:
 
-1. Go to [Google Takeout](https://takeout.google.com) → **Manage exports**
-2. Find your export and click **Download** on the first file
-3. **Before the download starts** or while it's downloading:
-   - Open DevTools: Press `F12` or `Ctrl+Shift+I`
-   - Go to the **Network** tab
-   - Find the request that starts with `takeout-` or look for a redirect
-   - Right-click the request → **Copy** → **Copy link address**
-4. Paste this URL as `TAKEOUT_URL` in your `.env`
+```
+# You provide this (file 001):
+https://takeout-download.usercontent.google.com/download/takeout-20251204T101148Z-3-001.zip?j=abc123&i=0&user=12345
 
-#### Firefox
+# Script automatically generates:
+https://takeout-download.usercontent.google.com/download/takeout-20251204T101148Z-3-002.zip?j=abc123&i=0&user=12345
+https://takeout-download.usercontent.google.com/download/takeout-20251204T101148Z-3-003.zip?j=abc123&i=0&user=12345
+... and so on
+```
 
-1. Go to [Google Takeout](https://takeout.google.com) → **Manage exports**
-2. Find your export and click **Download** on the first file
-3. **Before the download starts** or while it's downloading:
-   - Open DevTools: Press `F12` or `Ctrl+Shift+I`
-   - Go to the **Network** tab
-   - Look for the request (filter by "takeout" if needed)
-   - Right-click the request → **Copy Value** → **Copy URL**
-4. Paste this URL as `TAKEOUT_URL` in your `.env`
+The query parameters (`j=`, `i=`, `user=`) stay the same - only the file number changes.
 
-#### Alternative: Copy Link from Download Page
+### How to Get the First URL
 
-1. On the Google Takeout download page, **right-click** the "Download" button for file 1
-2. Select **Copy link address** (Chrome) or **Copy Link** (Firefox)
-3. This gives you the initial redirect URL which also works
+#### Method 1: Right-Click the Download Button (Easiest)
+
+**Chrome / Edge:**
+1. Go to [Google Takeout](https://takeout.google.com) → click **Manage exports**
+2. Find your export - you'll see a list of files (1 of 730, 2 of 730, etc.)
+3. **Right-click** the "Download" button for **file 1**
+4. Click **Copy link address**
+5. Paste into your `.env` as `TAKEOUT_URL`
+
+**Firefox:**
+1. Go to [Google Takeout](https://takeout.google.com) → click **Manage exports**
+2. Find your export - you'll see a list of files
+3. **Right-click** the "Download" button for **file 1**
+4. Click **Copy Link**
+5. Paste into your `.env` as `TAKEOUT_URL`
+
+#### Method 2: From Network Tab (If Method 1 doesn't work)
+
+**Chrome / Edge:**
+1. Open DevTools (`F12`) → **Network** tab
+2. Click the Download button for file 1
+3. Look for a request containing `takeout-` in the Name column
+4. Right-click it → **Copy** → **Copy URL**
+
+**Firefox:**
+1. Open DevTools (`F12`) → **Network** tab
+2. Click the Download button for file 1
+3. Look for a request containing `takeout-`
+4. Right-click it → **Copy Value** → **Copy URL**
 
 ### Example URL
+
+Your URL will look something like this:
 
 ```
 https://takeout-download.usercontent.google.com/download/takeout-20251204T101148Z-3-001.zip?j=ceabdffe-95b3-40e5-8790-2119226fe093&i=0&user=987312302921&authuser=0
 ```
 
-The script parses this and generates:
-- `takeout-20251204T101148Z-3-001.zip`
-- `takeout-20251204T101148Z-3-002.zip`
-- `takeout-20251204T101148Z-3-003.zip`
-- ... and so on
+Breaking it down:
+- `takeout-20251204T101148Z` - Timestamp of your export
+- `3` - Batch number (if you've done multiple exports)
+- `001` - **File number** (this is what gets incremented)
+- `?j=...&i=...&user=...` - Authentication parameters (kept for all files)
 
 ## Getting Your Cookie
 
