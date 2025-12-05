@@ -9,15 +9,18 @@ A Python script to bulk download Google Takeout archives using browser cookies f
 - **Resume Support** - Skips already downloaded files
 - **Interactive Re-authentication** - Prompts for new cookies when session expires (no restart needed)
 - **cURL Paste Support** - Just paste the entire cURL command, cookie is extracted automatically
-- **Progress Tracking** - Shows download progress for each file
+- **Progress Tracking** - Shows download progress for each file with ETA
 - **Optimized Performance** - Large chunk sizes, connection pooling, and keep-alive
+- **Desktop Notifications** - Get notified when auth expires or downloads complete (Linux)
+- **Sound Alerts** - Audio alerts for auth expiry and completion
+- **Auth Expiry Warning** - Warns before session expires (~45 min) so you can refresh proactively
 
 ## Installation
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/google-takeout-downloader.git
-cd google-takeout-downloader
+git clone https://github.com/clivewatts/takeout_downloader_script.git
+cd takeout_downloader_script
 
 # Create virtual environment
 python3 -m venv venv
@@ -112,6 +115,43 @@ Paste the ENTIRE cURL command below (or 'q' to quit):
 ------------------------------------------------------------
 ```
 
+## Notifications & Alerts
+
+The script includes desktop notifications and sound alerts (Linux):
+
+- **🔐 Auth Expired** - Critical notification + sound when authentication fails
+- **⚠️ Auth Warning** - Warning at ~45 minutes (sessions typically expire after ~1 hour)
+- **✅ Complete** - Notification + sound when all downloads finish
+
+### Requirements for Notifications
+
+```bash
+# Desktop notifications (usually pre-installed)
+sudo zypper install libnotify-tools  # openSUSE
+sudo apt install libnotify-bin       # Ubuntu/Debian
+
+# Sound alerts (PulseAudio)
+# Usually pre-installed with desktop environments
+```
+
+### Example Output
+
+```
+[takeout-3-001.zip] Starting (2.00 GB)
+[takeout-3-001.zip] 25% (ETA: 2h 15m)
+[takeout-3-001.zip] 50% (ETA: 1h 45m)
+[takeout-3-001.zip] 75% (ETA: 58m)
+[takeout-3-001.zip] Done!
+
+⚠️  Auth session active for 45+ minutes - may expire soon
+
+============================================================
+Download complete! 50 succeeded, 0 failed
+Files saved to: /smb/takeout
+Total downloaded: 100.00 GB in 1:23:45
+============================================================
+```
+
 ## Tips
 
 - **NFS/SMB Mounts**: If downloading to a network share, mount with your user permissions:
@@ -122,6 +162,14 @@ Paste the ENTIRE cURL command below (or 'q' to quit):
 - **Parallel Downloads**: Start with 2-4 parallel downloads. Too many may trigger rate limiting.
 
 - **Large Exports**: Google Takeout splits exports into 2GB files. A full Google account backup can be 100+ files.
+
+- **Run in Background**: Use `screen` or `tmux` to keep downloads running after closing terminal:
+  ```bash
+  screen -S takeout
+  ./venv/bin/python google_takeout_downloader.py
+  # Press Ctrl+A, D to detach
+  # screen -r takeout to reattach
+  ```
 
 ## License
 
