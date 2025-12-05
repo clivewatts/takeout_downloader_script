@@ -86,6 +86,25 @@ def extract_cookie_from_curl(curl_text: str) -> str:
     
     return cookie
 
+def extract_url_from_curl(curl_text: str) -> str:
+    """Extract the download URL from a cURL command."""
+    # Match URL in curl command: curl 'URL' or curl "URL"
+    match = re.search(r"curl\s+['\"]?(https?://[^'\"\s]+)['\"]?", curl_text, re.IGNORECASE)
+    if match:
+        url = match.group(1)
+        # Verify it's a takeout URL
+        if 'takeout' in url.lower():
+            return url
+    return None
+
+def extract_from_curl(curl_text: str) -> tuple[str, str]:
+    """Extract both cookie and URL from a cURL command.
+    Returns (cookie, url) - either may be None if not found.
+    """
+    cookie = extract_cookie_from_curl(curl_text)
+    url = extract_url_from_curl(curl_text)
+    return cookie, url
+
 def create_session(cookie: str) -> requests.Session:
     """Create an optimized session for downloads."""
     session = requests.Session()
@@ -254,21 +273,27 @@ class TakeoutDownloaderGUI:
                                     font=(ModernStyle.FONT_FAMILY, ModernStyle.FONT_SIZE))
         self.cookie_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         
+        # Bind to detect when user pastes cURL
+        self.cookie_entry.bind('<KeyRelease>', self.on_cookie_change)
+        self.cookie_entry.bind('<<Paste>>', lambda e: self.root.after(100, self.on_cookie_change))
+        
         # Add scrollbar
         cookie_scroll = ttk.Scrollbar(cookie_input_frame, command=self.cookie_entry.yview)
         cookie_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.cookie_entry.config(yscrollcommand=cookie_scroll.set)
         
         # Paste hint
-        ttk.Label(cookie_frame, text="Paste entire cURL command or just the cookie value",
+        self.cookie_hint = ttk.Label(cookie_frame, 
+                 text="Paste entire cURL command - URL will be auto-extracted!",
                  foreground=ModernStyle.TEXT_DIM,
-                 font=(ModernStyle.FONT_FAMILY, ModernStyle.FONT_SIZE_SMALL)).pack(anchor=tk.W)
+                 font=(ModernStyle.FONT_FAMILY, ModernStyle.FONT_SIZE_SMALL))
+        self.cookie_hint.pack(anchor=tk.W)
         
         # URL input
         url_frame = ttk.Frame(config_frame)
         url_frame.pack(fill=tk.X, pady=5)
         
-        ttk.Label(url_frame, text="🔗 First Download URL:").pack(anchor=tk.W)
+        ttk.Label(url_frame, text="🔗 First Download URL (auto-filled from cURL):").pack(anchor=tk.W)
         
         self.url_entry = tk.Entry(url_frame, textvariable=self.current_url,
                                   bg=ModernStyle.BG_MEDIUM, fg=ModernStyle.TEXT,
@@ -276,9 +301,10 @@ class TakeoutDownloaderGUI:
                                   relief=tk.FLAT, font=(ModernStyle.FONT_FAMILY, ModernStyle.FONT_SIZE))
         self.url_entry.pack(fill=tk.X, pady=2, ipady=8)
         
-        ttk.Label(url_frame, text="Right-click first download button → Copy link address",
+        self.url_hint = ttk.Label(url_frame, text="Or paste URL manually if not using cURL",
                  foreground=ModernStyle.TEXT_DIM,
-                 font=(ModernStyle.FONT_FAMILY, ModernStyle.FONT_SIZE_SMALL)).pack(anchor=tk.W)
+                 font=(ModernStyle.FONT_FAMILY, ModernStyle.FONT_SIZE_SMALL))
+        self.url_hint.pack(anchor=tk.W)
         
         # Output directory
         dir_frame = ttk.Frame(config_frame)
@@ -418,6 +444,29 @@ class TakeoutDownloaderGUI:
         directory = filedialog.askdirectory(initialdir=self.output_dir.get())
         if directory:
             self.output_dir.set(directory)
+    
+    def on_cookie_change(self, event=None):
+        """Called when cookie/cURL text changes - auto-extract URL if present."""
+        curl_text = self.cookie_entry.get('1.0', tk.END).strip()
+        
+        if not curl_text:
+            return
+        
+        # Try to extract URL from cURL command
+        url = extract_url_from_curl(curl_text)
+        
+        if url:
+            # Auto-fill the URL field
+            self.current_url.set(url)
+            # Update hints to show success
+            self.cookie_hint.config(text="✓ Cookie extracted from cURL", foreground=ModernStyle.SUCCESS)
+            self.url_hint.config(text="✓ URL auto-filled from cURL", foreground=ModernStyle.SUCCESS)
+        elif 'curl' in curl_text.lower():
+            # It's a cURL but no takeout URL found
+            self.cookie_hint.config(text="✓ Cookie found, but no takeout URL in cURL", foreground=ModernStyle.WARNING)
+        else:
+            # Just a cookie value
+            self.cookie_hint.config(text="Cookie value entered", foreground=ModernStyle.TEXT_DIM)
     
     def load_env(self):
         """Load settings from .env file if exists."""

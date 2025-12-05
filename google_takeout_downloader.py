@@ -33,6 +33,29 @@ def load_env_file(env_path: Path = None):
                 value = value.strip().strip('"').strip("'")
                 os.environ.setdefault(key, value)
 
+def extract_cookie_from_curl_early(curl_text: str) -> str:
+    """Extract cookie value from a cURL command (early version for arg parsing)."""
+    if 'curl' in curl_text or "-H 'Cookie:" in curl_text or '-H "Cookie:' in curl_text:
+        match = re.search(r"-H\s*['\"]Cookie:\s*([^'\"]+)['\"]", curl_text, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    if curl_text.lower().startswith('cookie:'):
+        return curl_text[7:].strip()
+    cookie = curl_text.strip()
+    if (cookie.startswith("'") and cookie.endswith("'")) or \
+       (cookie.startswith('"') and cookie.endswith('"')):
+        cookie = cookie[1:-1]
+    return cookie
+
+def extract_url_from_curl_early(curl_text: str) -> str:
+    """Extract the download URL from a cURL command (early version for arg parsing)."""
+    match = re.search(r"curl\s+['\"]?(https?://[^'\"\s]+)['\"]?", curl_text, re.IGNORECASE)
+    if match:
+        url = match.group(1)
+        if 'takeout' in url.lower():
+            return url
+    return None
+
 def parse_arguments():
     import argparse
     
@@ -63,8 +86,20 @@ def parse_arguments():
     # Validate required args
     if not args.cookie:
         parser.error('Cookie is required. Set --cookie or GOOGLE_COOKIE in .env')
+    
+    # Try to extract URL from cookie if it's a cURL command and no URL provided
+    if not args.url and args.cookie:
+        extracted_url = extract_url_from_curl_early(args.cookie)
+        if extracted_url:
+            args.url = extracted_url
+            print(f"✓ Auto-extracted URL from cURL command")
+    
     if not args.url:
-        parser.error('URL is required. Set --url or TAKEOUT_URL in .env')
+        parser.error('URL is required. Set --url, TAKEOUT_URL in .env, or paste full cURL as --cookie')
+    
+    # Extract actual cookie if full cURL was provided
+    if 'curl' in args.cookie.lower():
+        args.cookie = extract_cookie_from_curl_early(args.cookie)
     
     return args
 
@@ -250,6 +285,17 @@ def extract_cookie_from_curl(curl_text: str) -> str:
         cookie = cookie[1:-1]
     
     return cookie
+
+def extract_url_from_curl(curl_text: str) -> str:
+    """Extract the download URL from a cURL command."""
+    # Match URL in curl command: curl 'URL' or curl "URL"
+    match = re.search(r"curl\s+['\"]?(https?://[^'\"\s]+)['\"]?", curl_text, re.IGNORECASE)
+    if match:
+        url = match.group(1)
+        # Verify it's a takeout URL
+        if 'takeout' in url.lower():
+            return url
+    return None
 
 def prompt_for_new_cookie(is_warning: bool = False) -> str:
     """Prompt user for new cookie interactively."""

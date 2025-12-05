@@ -71,85 +71,48 @@ FILE_COUNT=100
 PARALLEL_DOWNLOADS=6
 ```
 
-## Getting the Initial Download URL
+## Quick Setup - Just Paste cURL!
 
-### What is this and why do we need it?
+The easiest way to use this tool: **just paste the cURL command** and everything is auto-extracted!
 
-When you create a Google Takeout export, Google splits your data into multiple 2GB ZIP files. A large account might have **hundreds of files** like:
+### One-Step Setup
+
+1. Go to [Google Takeout](https://takeout.google.com) → **Manage exports**
+2. Open DevTools (`F12`) → **Network** tab
+3. Click the **Download** button for **file 1**
+4. Right-click the request → **Copy** → **Copy as cURL**
+5. Paste into the app - **both cookie AND URL are extracted automatically!**
+
+That's it! The GUI will show:
+- ✓ Cookie extracted from cURL
+- ✓ URL auto-filled from cURL
+
+### How It Works
+
+When you create a Google Takeout export, Google splits your data into multiple 2GB ZIP files:
 
 ```
 takeout-20251204T101148Z-3-001.zip
 takeout-20251204T101148Z-3-002.zip
-takeout-20251204T101148Z-3-003.zip
 ...
 takeout-20251204T101148Z-3-730.zip
 ```
 
-Google doesn't provide a "download all" button - you'd have to click each file individually. This script solves that by **extrapolating all the download URLs from just the first one**.
+The cURL command contains both:
+- **The download URL** - for file 001, which we increment to get 002, 003, etc.
+- **The cookie** - for authentication
 
-### How URL Extrapolation Works
+### Manual Setup (Alternative)
 
-You provide the URL for file `001`, and the script automatically generates URLs for `002`, `003`, etc. by incrementing the file number:
+If you prefer to set things up manually in `.env`:
 
-```
-# You provide this (file 001):
-https://takeout-download.usercontent.google.com/download/takeout-20251204T101148Z-3-001.zip?j=abc123&i=0&user=12345
+**Get the URL:**
+- Right-click the "Download" button for file 1 → **Copy link address**
 
-# Script automatically generates:
-https://takeout-download.usercontent.google.com/download/takeout-20251204T101148Z-3-002.zip?j=abc123&i=0&user=12345
-https://takeout-download.usercontent.google.com/download/takeout-20251204T101148Z-3-003.zip?j=abc123&i=0&user=12345
-... and so on
-```
+**Get the Cookie:**
+- Copy as cURL → find `-H 'Cookie: ...'` → copy the value
 
-The query parameters (`j=`, `i=`, `user=`) stay the same - only the file number changes.
-
-### How to Get the First URL
-
-#### Method 1: Right-Click the Download Button (Easiest)
-
-**Chrome / Edge:**
-1. Go to [Google Takeout](https://takeout.google.com) → click **Manage exports**
-2. Find your export - you'll see a list of files (1 of 730, 2 of 730, etc.)
-3. **Right-click** the "Download" button for **file 1**
-4. Click **Copy link address**
-5. Paste into your `.env` as `TAKEOUT_URL`
-
-**Firefox:**
-1. Go to [Google Takeout](https://takeout.google.com) → click **Manage exports**
-2. Find your export - you'll see a list of files
-3. **Right-click** the "Download" button for **file 1**
-4. Click **Copy Link**
-5. Paste into your `.env` as `TAKEOUT_URL`
-
-#### Method 2: From Network Tab (If Method 1 doesn't work)
-
-**Chrome / Edge:**
-1. Open DevTools (`F12`) → **Network** tab
-2. Click the Download button for file 1
-3. Look for a request containing `takeout-` in the Name column
-4. Right-click it → **Copy** → **Copy URL**
-
-**Firefox:**
-1. Open DevTools (`F12`) → **Network** tab
-2. Click the Download button for file 1
-3. Look for a request containing `takeout-`
-4. Right-click it → **Copy Value** → **Copy URL**
-
-### Example URL
-
-Your URL will look something like this:
-
-```
-https://takeout-download.usercontent.google.com/download/takeout-20251204T101148Z-3-001.zip?j=ceabdffe-95b3-40e5-8790-2119226fe093&i=0&user=987312302921&authuser=0
-```
-
-Breaking it down:
-- `takeout-20251204T101148Z` - Timestamp of your export
-- `3` - Batch number (if you've done multiple exports)
-- `001` - **File number** (this is what gets incremented)
-- `?j=...&i=...&user=...` - Authentication parameters (kept for all files)
-
-## Getting Your Cookie
+## Getting Your Cookie (Details)
 
 The cookie authenticates your requests. Google sessions typically expire after ~1 hour.
 
