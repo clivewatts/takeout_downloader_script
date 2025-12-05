@@ -2,6 +2,8 @@
 import os
 import re
 import sys
+import time
+import subprocess
 import requests
 from urllib.parse import urlparse
 from pathlib import Path
@@ -10,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from datetime import datetime, timedelta
 
 def load_env_file(env_path: Path = None):
     """Load environment variables from .env file."""
@@ -110,11 +113,105 @@ print_lock = threading.Lock()
 # Shared cookie that can be updated
 cookie_lock = threading.Lock()
 current_cookie = None
+# Track download statistics
+stats_lock = threading.Lock()
+download_stats = {
+    'start_time': None,
+    'bytes_downloaded': 0,
+    'files_completed': 0,
+    'total_files': 0,
+    'total_bytes': 0,
+    'auth_start_time': None,  # When current auth session started
+}
+
+# Auth timeout warning (Google sessions typically last ~1 hour)
+AUTH_WARNING_MINUTES = 45
 
 def safe_print(*args, **kwargs):
     """Thread-safe print."""
     with print_lock:
         print(*args, **kwargs)
+
+def send_notification(title: str, message: str, urgent: bool = False):
+    """Send desktop notification (Linux)."""
+    try:
+        urgency = 'critical' if urgent else 'normal'
+        subprocess.run(
+            ['notify-send', '-u', urgency, '-a', 'Takeout Downloader', title, message],
+            capture_output=True,
+            timeout=5
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass  # notify-send not available or timed out
+
+def play_sound(sound_type: str = 'alert'):
+    """Play a sound alert (Linux)."""
+    try:
+        if sound_type == 'alert':
+            # Try paplay (PulseAudio) first
+            subprocess.run(
+                ['paplay', '/usr/share/sounds/freedesktop/stereo/dialog-warning.oga'],
+                capture_output=True,
+                timeout=5
+            )
+        elif sound_type == 'complete':
+            subprocess.run(
+                ['paplay', '/usr/share/sounds/freedesktop/stereo/complete.oga'],
+                capture_output=True,
+                timeout=5
+            )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        # Try beep as fallback
+        try:
+            subprocess.run(['beep'], capture_output=True, timeout=2)
+        except:
+            pass  # No sound available
+
+def update_stats(bytes_downloaded: int = 0, file_completed: bool = False):
+    """Update download statistics."""
+    with stats_lock:
+        download_stats['bytes_downloaded'] += bytes_downloaded
+        if file_completed:
+            download_stats['files_completed'] += 1
+
+def get_eta() -> str:
+    """Calculate estimated time remaining."""
+    with stats_lock:
+        if not download_stats['start_time'] or download_stats['bytes_downloaded'] == 0:
+            return "calculating..."
+        
+        elapsed = (datetime.now() - download_stats['start_time']).total_seconds()
+        if elapsed < 1:
+            return "calculating..."
+        
+        bytes_per_sec = download_stats['bytes_downloaded'] / elapsed
+        remaining_bytes = download_stats['total_bytes'] - download_stats['bytes_downloaded']
+        
+        if bytes_per_sec > 0:
+            remaining_secs = remaining_bytes / bytes_per_sec
+            if remaining_secs < 60:
+                return f"{int(remaining_secs)}s"
+            elif remaining_secs < 3600:
+                return f"{int(remaining_secs / 60)}m"
+            else:
+                hours = int(remaining_secs / 3600)
+                mins = int((remaining_secs % 3600) / 60)
+                return f"{hours}h {mins}m"
+        return "unknown"
+
+def check_auth_expiry_warning() -> bool:
+    """Check if auth might expire soon and warn user."""
+    with stats_lock:
+        if download_stats['auth_start_time']:
+            elapsed = datetime.now() - download_stats['auth_start_time']
+            if elapsed > timedelta(minutes=AUTH_WARNING_MINUTES):
+                return True
+    return False
+
+def reset_auth_timer():
+    """Reset the auth timer when new cookie is provided."""
+    with stats_lock:
+        download_stats['auth_start_time'] = datetime.now()
 
 def get_current_cookie() -> str:
     """Get the current cookie value (thread-safe)."""
@@ -154,11 +251,44 @@ def extract_cookie_from_curl(curl_text: str) -> str:
     
     return cookie
 
-def prompt_for_new_cookie() -> str:
+def prompt_for_new_cookie(is_warning: bool = False) -> str:
     """Prompt user for new cookie interactively."""
-    print("\n" + "=" * 60)
-    print("AUTHENTICATION EXPIRED")
-    print("=" * 60)
+    # Send notification and sound
+    if is_warning:
+        send_notification(
+            "⚠️ Auth Expiring Soon",
+            "Google Takeout session may expire soon. Consider refreshing cookie.",
+            urgent=False
+        )
+        play_sound('alert')
+        print("\n" + "=" * 60)
+        print("⚠️  AUTH MAY EXPIRE SOON")
+        print("=" * 60)
+        print(f"\nSession has been active for ~{AUTH_WARNING_MINUTES} minutes.")
+        print("Google sessions typically expire after ~1 hour.")
+        print("\nWould you like to refresh your cookie now? (y/n/q)")
+        print("-" * 60)
+        
+        try:
+            response = input().strip().lower()
+            if response == 'n':
+                return None  # Continue without refresh
+            elif response == 'q':
+                return 'QUIT'
+            # Fall through to cookie prompt
+        except (EOFError, KeyboardInterrupt):
+            return None
+    else:
+        send_notification(
+            "🔐 Authentication Required",
+            "Google Takeout cookie expired. Please provide new cookie.",
+            urgent=True
+        )
+        play_sound('alert')
+        print("\n" + "=" * 60)
+        print("🔐 AUTHENTICATION EXPIRED")
+        print("=" * 60)
+    
     print("\nTo get a new cookie:")
     print("1. Open Chrome DevTools (F12) on Google Takeout")
     print("2. Go to Network tab")
@@ -263,13 +393,16 @@ def download_file(url: str, output_path: Path, file_num: int) -> tuple[int, bool
                     if chunk:
                         f.write(chunk)
                         downloaded += len(chunk)
+                        update_stats(bytes_downloaded=len(chunk))
                         if total_size > 0:
                             percent = int((downloaded / total_size) * 100)
                             # Only print every 25%
                             if percent >= last_percent + 25:
                                 last_percent = percent
-                                safe_print(f"[{filename}] {percent}%")
+                                eta = get_eta()
+                                safe_print(f"[{filename}] {percent}% (ETA: {eta})")
             
+            update_stats(file_completed=True)
             return (file_num, True, f"[{filename}] Done!", False)
             
     except requests.exceptions.RequestException as e:
@@ -280,8 +413,9 @@ def download_file(url: str, output_path: Path, file_num: int) -> tuple[int, bool
 def main():
     args = parse_arguments()
     
-    # Initialize the shared cookie
+    # Initialize the shared cookie and auth timer
     set_current_cookie(args.cookie)
+    reset_auth_timer()
     
     # Create output directory if it doesn't exist
     output_dir = Path(args.output).resolve()
@@ -323,10 +457,18 @@ def main():
     print(f"\n{skipped} files skipped (already exist), {len(downloads)} files to download")
     print("-" * 60)
     
+    # Initialize stats
+    with stats_lock:
+        download_stats['start_time'] = datetime.now()
+        download_stats['total_files'] = len(downloads)
+        # Estimate total bytes (assume 2GB per file)
+        download_stats['total_bytes'] = len(downloads) * 2 * 1024 * 1024 * 1024
+    
     # Download files in parallel with re-auth support
     success_count = skipped
     failed_count = 0
     remaining_downloads = downloads.copy()
+    auth_warning_shown = False
     
     while remaining_downloads:
         failed_this_round = []
@@ -346,6 +488,17 @@ def main():
                     
                     if success:
                         success_count += 1
+                        
+                        # Check if auth might expire soon (every few files)
+                        if not auth_warning_shown and check_auth_expiry_warning():
+                            auth_warning_shown = True
+                            # Don't block, just warn
+                            send_notification(
+                                "⚠️ Auth May Expire Soon",
+                                f"Session active for {AUTH_WARNING_MINUTES}+ mins. Consider refreshing.",
+                                urgent=False
+                            )
+                            safe_print(f"\n⚠️  Auth session active for {AUTH_WARNING_MINUTES}+ minutes - may expire soon")
                     else:
                         if is_auth_fail:
                             auth_failed = True
@@ -366,8 +519,13 @@ def main():
         if auth_failed:
             # Prompt for new cookie
             new_cookie = prompt_for_new_cookie()
-            if new_cookie:
+            if new_cookie == 'QUIT':
+                print("\nQuitting...")
+                break
+            elif new_cookie:
                 set_current_cookie(new_cookie)
+                reset_auth_timer()
+                auth_warning_shown = False
                 print("\nCookie updated! Resuming downloads...")
                 print("-" * 60)
                 # Rebuild remaining downloads (files not yet downloaded)
@@ -383,9 +541,26 @@ def main():
             # No auth failure, we're done with this round
             break
     
+    # Final notification
+    if success_count > 0:
+        send_notification(
+            "✅ Downloads Complete",
+            f"{success_count} files downloaded, {failed_count} failed",
+            urgent=False
+        )
+        play_sound('complete')
+    
     print("\n" + "=" * 60)
     print(f"Download complete! {success_count} succeeded, {failed_count} failed")
     print(f"Files saved to: {output_dir}")
+    
+    # Show final stats
+    with stats_lock:
+        if download_stats['start_time']:
+            elapsed = datetime.now() - download_stats['start_time']
+            total_gb = download_stats['bytes_downloaded'] / (1024*1024*1024)
+            print(f"Total downloaded: {total_gb:.2f} GB in {elapsed}")
+    
     print("=" * 60)
 
 if __name__ == "__main__":
