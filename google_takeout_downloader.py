@@ -431,6 +431,10 @@ def download_file(url: str, output_path: Path, file_num: int) -> tuple[int, bool
             size_gb = total_size / (1024*1024*1024)
             safe_print(f"[{filename}] Starting ({size_gb:.2f} GB)")
             
+            # Track per-file download speed
+            file_start_time = time.time()
+            last_speed_update = time.time()
+            
             # Use larger buffer for writing
             with open(output_path, 'wb', buffering=CHUNK_SIZE) as f:
                 downloaded = 0
@@ -440,13 +444,19 @@ def download_file(url: str, output_path: Path, file_num: int) -> tuple[int, bool
                         f.write(chunk)
                         downloaded += len(chunk)
                         update_stats(bytes_downloaded=len(chunk))
+                        
+                        now = time.time()
                         if total_size > 0:
                             percent = int((downloaded / total_size) * 100)
-                            # Only print every 25%
-                            if percent >= last_percent + 25:
-                                last_percent = percent
-                                eta = get_eta()
-                                safe_print(f"[{filename}] {percent}% (ETA: {eta})")
+                            # Update every 10% or every 5 seconds
+                            if percent >= last_percent + 10 or (now - last_speed_update >= 5):
+                                last_percent = (percent // 10) * 10  # Round to nearest 10%
+                                elapsed = now - file_start_time
+                                if elapsed > 0:
+                                    speed_mbps = (downloaded / elapsed) / (1024 * 1024)
+                                    eta = get_eta()
+                                    safe_print(f"[{filename}] {percent}% @ {speed_mbps:.1f} MB/s (ETA: {eta})")
+                                last_speed_update = now
             
             update_stats(file_completed=True)
             return (file_num, True, f"[{filename}] Done!", False)

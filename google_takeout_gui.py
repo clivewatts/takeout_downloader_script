@@ -750,13 +750,30 @@ class TakeoutDownloaderGUI:
                 size_mb = total_size / (1024*1024)
                 self.log(f"↓ {filename} ({size_mb:.0f} MB)", 'info')
                 
+                # Track per-file download speed
+                file_start_time = time.time()
+                file_downloaded = 0
+                last_speed_update = time.time()
+                
                 with open(output_path, 'wb', buffering=CHUNK_SIZE) as f:
                     for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
                         if self.should_stop:
                             return (False, "Stopped by user", False)
                         if chunk:
                             f.write(chunk)
-                            self.stats['bytes_downloaded'] += len(chunk)
+                            chunk_len = len(chunk)
+                            file_downloaded += chunk_len
+                            self.stats['bytes_downloaded'] += chunk_len
+                            
+                            # Update speed every 2 seconds
+                            now = time.time()
+                            if now - last_speed_update >= 2:
+                                elapsed = now - file_start_time
+                                if elapsed > 0:
+                                    speed_mbps = (file_downloaded / elapsed) / (1024 * 1024)
+                                    percent = int((file_downloaded / total_size) * 100) if total_size > 0 else 0
+                                    self.log(f"  {filename}: {percent}% @ {speed_mbps:.1f} MB/s", 'info')
+                                last_speed_update = now
                 
                 return (True, "Success", False)
                 
