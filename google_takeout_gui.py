@@ -13,7 +13,7 @@ import time
 import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Dict
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import requests
@@ -38,6 +38,7 @@ class ModernStyle:
     TEXT = "#f8fafc"
     TEXT_DIM = "#94a3b8"
     BORDER = "#4b5563"
+    BLUE = "#3b82f6"
     
     # Fonts
     FONT_FAMILY = "Segoe UI"
@@ -134,8 +135,8 @@ class TakeoutDownloaderGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Google Takeout Bulk Downloader")
-        self.root.geometry("900x700")
-        self.root.minsize(800, 600)
+        self.root.geometry("950x800")
+        self.root.minsize(900, 750)
         
         # Set dark theme
         self.root.configure(bg=ModernStyle.BG_DARK)
@@ -160,6 +161,10 @@ class TakeoutDownloaderGUI:
             'bytes_downloaded': 0,
             'start_time': None
         }
+        
+        # Active downloads tracking {filename: {progress_bar, label, speed_label, ...}}
+        self.active_downloads: Dict[str, dict] = {}
+        self.active_downloads_lock = threading.Lock()
         
         # Message queue for thread-safe UI updates
         self.msg_queue = queue.Queue()
@@ -359,7 +364,7 @@ class TakeoutDownloaderGUI:
         parallel_spin.pack(side=tk.LEFT, padx=5)
     
     def create_progress_section(self, parent):
-        """Create progress display."""
+        """Create progress display with active downloads panel."""
         progress_frame = ttk.Frame(parent)
         progress_frame.pack(fill=tk.X, pady=10)
         
@@ -385,16 +390,115 @@ class TakeoutDownloaderGUI:
         self.progress_detail = ttk.Label(progress_frame, text="0 / 0 files",
                                          foreground=ModernStyle.TEXT_DIM)
         self.progress_detail.pack(anchor=tk.W)
+        
+        # Active Downloads Section
+        active_frame = ttk.Frame(parent)
+        active_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 5))
+        
+        ttk.Label(active_frame, text="⬇️ Active Downloads:", 
+                 font=(ModernStyle.FONT_FAMILY, ModernStyle.FONT_SIZE_LARGE)).pack(anchor=tk.W)
+        
+        # Scrollable container for active downloads
+        self.downloads_canvas = tk.Canvas(active_frame, bg=ModernStyle.BG_MEDIUM, 
+                                          highlightthickness=0, height=180)
+        downloads_scrollbar = ttk.Scrollbar(active_frame, orient="vertical", 
+                                            command=self.downloads_canvas.yview)
+        self.downloads_container = ttk.Frame(self.downloads_canvas)
+        
+        self.downloads_canvas.configure(yscrollcommand=downloads_scrollbar.set)
+        
+        downloads_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.downloads_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=5)
+        
+        self.canvas_window = self.downloads_canvas.create_window((0, 0), window=self.downloads_container, anchor="nw")
+        
+        # Configure canvas scrolling
+        self.downloads_container.bind("<Configure>", self._on_downloads_configure)
+        self.downloads_canvas.bind("<Configure>", self._on_canvas_configure)
+    
+    def _on_downloads_configure(self, event):
+        """Update scroll region when downloads container changes."""
+        self.downloads_canvas.configure(scrollregion=self.downloads_canvas.bbox("all"))
+    
+    def _on_canvas_configure(self, event):
+        """Update container width when canvas resizes."""
+        self.downloads_canvas.itemconfig(self.canvas_window, width=event.width)
+    
+    def create_download_widget(self, filename: str, total_size: int):
+        """Create a download progress widget for a file."""
+        frame = tk.Frame(self.downloads_container, bg=ModernStyle.BG_LIGHT, padx=10, pady=8)
+        frame.pack(fill=tk.X, pady=2, padx=2)
+        
+        # Top row: filename and size
+        top_row = tk.Frame(frame, bg=ModernStyle.BG_LIGHT)
+        top_row.pack(fill=tk.X)
+        
+        name_label = tk.Label(top_row, text=f"📄 {filename}", 
+                             bg=ModernStyle.BG_LIGHT, fg=ModernStyle.TEXT,
+                             font=(ModernStyle.FONT_FAMILY, ModernStyle.FONT_SIZE, 'bold'))
+        name_label.pack(side=tk.LEFT)
+        
+        size_mb = total_size / (1024 * 1024)
+        size_label = tk.Label(top_row, text=f"{size_mb:.0f} MB",
+                             bg=ModernStyle.BG_LIGHT, fg=ModernStyle.TEXT_DIM,
+                             font=(ModernStyle.FONT_FAMILY, ModernStyle.FONT_SIZE_SMALL))
+        size_label.pack(side=tk.RIGHT)
+        
+        # Progress bar
+        progress_var = tk.DoubleVar(value=0)
+        progress_bar = ttk.Progressbar(frame, variable=progress_var, maximum=100, length=300)
+        progress_bar.pack(fill=tk.X, pady=(5, 3))
+        
+        # Bottom row: percent and speed
+        bottom_row = tk.Frame(frame, bg=ModernStyle.BG_LIGHT)
+        bottom_row.pack(fill=tk.X)
+        
+        percent_label = tk.Label(bottom_row, text="0%",
+                                bg=ModernStyle.BG_LIGHT, fg=ModernStyle.ACCENT,
+                                font=(ModernStyle.FONT_FAMILY, ModernStyle.FONT_SIZE))
+        percent_label.pack(side=tk.LEFT)
+        
+        speed_label = tk.Label(bottom_row, text="Starting...",
+                              bg=ModernStyle.BG_LIGHT, fg=ModernStyle.SUCCESS,
+                              font=(ModernStyle.FONT_FAMILY, ModernStyle.FONT_SIZE, 'bold'))
+        speed_label.pack(side=tk.RIGHT)
+        
+        return {
+            'frame': frame,
+            'progress_var': progress_var,
+            'percent_label': percent_label,
+            'speed_label': speed_label,
+            'total_size': total_size,
+            'start_time': time.time(),
+            'bytes_downloaded': 0
+        }
+    
+    def update_download_widget(self, filename: str, downloaded: int, speed_mbps: float):
+        """Update a download progress widget."""
+        with self.active_downloads_lock:
+            if filename not in self.active_downloads:
+                return
+            widget = self.active_downloads[filename]
+        
+        total = widget['total_size']
+        percent = (downloaded / total * 100) if total > 0 else 0
+        
+        # Queue UI update
+        self.msg_queue.put(('download_progress', filename, percent, speed_mbps))
+    
+    def remove_download_widget(self, filename: str, success: bool):
+        """Remove a download widget when complete."""
+        self.msg_queue.put(('download_complete', filename, success))
     
     def create_log_section(self, parent):
         """Create log output area."""
         log_frame = ttk.Frame(parent)
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+        log_frame.pack(fill=tk.BOTH, expand=True, pady=5)
         
-        ttk.Label(log_frame, text="📋 Download Log:").pack(anchor=tk.W)
+        ttk.Label(log_frame, text="📋 Event Log:").pack(anchor=tk.W)
         
         # Log text area
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=12,
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=8,
                                                   bg=ModernStyle.BG_MEDIUM,
                                                   fg=ModernStyle.TEXT,
                                                   insertbackground=ModernStyle.TEXT,
@@ -535,12 +639,36 @@ class TakeoutDownloaderGUI:
                         self.overall_progress['value'] = percent
                         self.progress_detail.config(text=f"{completed} / {total} files")
                         
-                        # Calculate speed and ETA
+                        # Calculate overall speed
                         if self.stats['start_time'] and bytes_dl > 0:
                             elapsed = (datetime.now() - self.stats['start_time']).total_seconds()
                             if elapsed > 0:
                                 speed_mbps = (bytes_dl / elapsed) / (1024 * 1024)
-                                self.stats_label.config(text=f"Speed: {speed_mbps:.1f} MB/s")
+                                total_gb = bytes_dl / (1024 * 1024 * 1024)
+                                self.stats_label.config(text=f"Total: {total_gb:.2f} GB @ {speed_mbps:.1f} MB/s avg")
+                
+                elif msg[0] == 'download_start':
+                    _, filename, total_size = msg
+                    widget = self.create_download_widget(filename, total_size)
+                    with self.active_downloads_lock:
+                        self.active_downloads[filename] = widget
+                
+                elif msg[0] == 'download_progress':
+                    _, filename, percent, speed_mbps = msg
+                    with self.active_downloads_lock:
+                        if filename in self.active_downloads:
+                            widget = self.active_downloads[filename]
+                            widget['progress_var'].set(percent)
+                            widget['percent_label'].config(text=f"{percent:.0f}%")
+                            widget['speed_label'].config(text=f"{speed_mbps:.1f} MB/s")
+                
+                elif msg[0] == 'download_complete':
+                    _, filename, success = msg
+                    with self.active_downloads_lock:
+                        if filename in self.active_downloads:
+                            widget = self.active_downloads[filename]
+                            widget['frame'].destroy()
+                            del self.active_downloads[filename]
                 
                 elif msg[0] == 'done':
                     self.download_complete()
@@ -552,7 +680,7 @@ class TakeoutDownloaderGUI:
             pass
         
         # Schedule next check
-        self.root.after(100, self.process_queue)
+        self.root.after(50, self.process_queue)
     
     def clear_log(self):
         """Clear the log text area."""
@@ -747,17 +875,19 @@ class TakeoutDownloaderGUI:
                 
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 
-                size_mb = total_size / (1024*1024)
-                self.log(f"↓ {filename} ({size_mb:.0f} MB)", 'info')
+                # Create download widget in UI
+                self.msg_queue.put(('download_start', filename, total_size))
                 
-                # Track per-file download speed
+                # Track per-file download speed with rolling window
                 file_start_time = time.time()
                 file_downloaded = 0
-                last_speed_update = time.time()
+                last_update_time = time.time()
+                last_update_bytes = 0
                 
                 with open(output_path, 'wb', buffering=CHUNK_SIZE) as f:
                     for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
                         if self.should_stop:
+                            self.msg_queue.put(('download_complete', filename, False))
                             return (False, "Stopped by user", False)
                         if chunk:
                             f.write(chunk)
@@ -765,19 +895,29 @@ class TakeoutDownloaderGUI:
                             file_downloaded += chunk_len
                             self.stats['bytes_downloaded'] += chunk_len
                             
-                            # Update speed every 2 seconds
+                            # Update speed every 500ms for responsive UI
                             now = time.time()
-                            if now - last_speed_update >= 2:
-                                elapsed = now - file_start_time
-                                if elapsed > 0:
-                                    speed_mbps = (file_downloaded / elapsed) / (1024 * 1024)
-                                    percent = int((file_downloaded / total_size) * 100) if total_size > 0 else 0
-                                    self.log(f"  {filename}: {percent}% @ {speed_mbps:.1f} MB/s", 'info')
-                                last_speed_update = now
+                            time_delta = now - last_update_time
+                            if time_delta >= 0.5:
+                                # Calculate instant speed from recent data
+                                bytes_delta = file_downloaded - last_update_bytes
+                                if time_delta > 0:
+                                    instant_speed = bytes_delta / time_delta / (1024 * 1024)
+                                else:
+                                    instant_speed = 0
+                                
+                                percent = (file_downloaded / total_size * 100) if total_size > 0 else 0
+                                self.msg_queue.put(('download_progress', filename, percent, instant_speed))
+                                
+                                last_update_time = now
+                                last_update_bytes = file_downloaded
                 
+                # Remove widget and mark complete
+                self.msg_queue.put(('download_complete', filename, True))
                 return (True, "Success", False)
                 
         except requests.exceptions.RequestException as e:
+            self.msg_queue.put(('download_complete', filename, False))
             if output_path.exists():
                 output_path.unlink()
             return (False, str(e), False)
