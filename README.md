@@ -57,14 +57,90 @@ FILE_COUNT=100
 PARALLEL_DOWNLOADS=6
 ```
 
+## Getting the Initial URL
+
+The `TAKEOUT_URL` in your `.env` file is the download link for the **first file** in your Google Takeout export. This URL contains:
+
+- **File pattern**: `takeout-20251204T101148Z-3-001.zip` - The script increments the `001` part to download `002`, `003`, etc.
+- **Authentication tokens**: Query parameters like `j=`, `i=`, `user=` that identify your export
+- **Session info**: The `authuser=` parameter for multi-account users
+
+### Why It's Needed
+
+Google Takeout splits large exports into multiple 2GB ZIP files (e.g., 730 files for a large account). Instead of manually clicking each download link, you provide the first URL and the script automatically constructs URLs for all subsequent files.
+
+### How to Get the URL
+
+#### Chrome / Chromium / Edge
+
+1. Go to [Google Takeout](https://takeout.google.com) → **Manage exports**
+2. Find your export and click **Download** on the first file
+3. **Before the download starts** or while it's downloading:
+   - Open DevTools: Press `F12` or `Ctrl+Shift+I`
+   - Go to the **Network** tab
+   - Find the request that starts with `takeout-` or look for a redirect
+   - Right-click the request → **Copy** → **Copy link address**
+4. Paste this URL as `TAKEOUT_URL` in your `.env`
+
+#### Firefox
+
+1. Go to [Google Takeout](https://takeout.google.com) → **Manage exports**
+2. Find your export and click **Download** on the first file
+3. **Before the download starts** or while it's downloading:
+   - Open DevTools: Press `F12` or `Ctrl+Shift+I`
+   - Go to the **Network** tab
+   - Look for the request (filter by "takeout" if needed)
+   - Right-click the request → **Copy Value** → **Copy URL**
+4. Paste this URL as `TAKEOUT_URL` in your `.env`
+
+#### Alternative: Copy Link from Download Page
+
+1. On the Google Takeout download page, **right-click** the "Download" button for file 1
+2. Select **Copy link address** (Chrome) or **Copy Link** (Firefox)
+3. This gives you the initial redirect URL which also works
+
+### Example URL
+
+```
+https://takeout-download.usercontent.google.com/download/takeout-20251204T101148Z-3-001.zip?j=ceabdffe-95b3-40e5-8790-2119226fe093&i=0&user=987312302921&authuser=0
+```
+
+The script parses this and generates:
+- `takeout-20251204T101148Z-3-001.zip`
+- `takeout-20251204T101148Z-3-002.zip`
+- `takeout-20251204T101148Z-3-003.zip`
+- ... and so on
+
 ## Getting Your Cookie
 
-1. Go to [Google Takeout](https://takeout.google.com) and create an export
-2. Once ready, go to the download page
-3. Open browser DevTools (F12) → **Network** tab
-4. Click any download link
-5. Right-click the request → **Copy** → **Copy as cURL**
-6. Paste the entire cURL command when prompted, or extract the cookie for `.env`
+The cookie authenticates your requests. Google sessions typically expire after ~1 hour.
+
+### Chrome / Chromium / Edge
+
+1. Go to the Google Takeout download page
+2. Open DevTools (`F12`) → **Network** tab
+3. Click any download link
+4. Find the request in the Network tab
+5. Right-click → **Copy** → **Copy as cURL (bash)**
+6. Paste the entire cURL command when prompted, or extract the `Cookie:` header for `.env`
+
+### Firefox
+
+1. Go to the Google Takeout download page
+2. Open DevTools (`F12`) → **Network** tab
+3. Click any download link
+4. Find the request in the Network tab
+5. Right-click → **Copy Value** → **Copy as cURL**
+6. Paste the entire cURL command when prompted, or extract the `Cookie:` header for `.env`
+
+### Extracting Cookie for `.env`
+
+If you prefer to put the cookie in `.env` instead of pasting cURL each time:
+
+1. Copy as cURL (as above)
+2. Find the part that says `-H 'Cookie: ...'`
+3. Copy everything between the quotes after `Cookie:`
+4. Paste as `GOOGLE_COOKIE` in your `.env`
 
 ## Usage
 
