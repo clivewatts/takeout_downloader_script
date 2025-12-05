@@ -1,19 +1,33 @@
 # Google Takeout Bulk Downloader
 
-A Python script to bulk download Google Takeout archives using browser cookies for authentication.
+A Python tool to bulk download Google Takeout archives using browser cookies for authentication. Available as both a **GUI application** and **command-line script**.
+
+![GUI Screenshot](https://img.shields.io/badge/GUI-Available-brightgreen) ![Python](https://img.shields.io/badge/Python-3.8+-blue) ![Platform](https://img.shields.io/badge/Platform-Linux%20|%20Windows%20|%20macOS-orange)
+
+## Quick Start - Download Pre-built Binaries
+
+Download the latest release for your platform (no Python required):
+
+| Platform | Download |
+|----------|----------|
+| **Linux** | [Google_Takeout_Downloader-linux-x64](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
+| **Windows** | [Google_Takeout_Downloader-windows-x64.exe](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
+| **macOS** | [Google_Takeout_Downloader-macos-x64.app](https://github.com/clivewatts/takeout_downloader_script/releases/latest) |
+
+Just download, run, and paste your cookie!
 
 ## Features
 
-- **Bulk Downloads** - Automatically downloads all numbered Takeout files (e.g., `takeout-001.zip`, `takeout-002.zip`, etc.)
-- **Parallel Downloads** - Configurable concurrent downloads (default: 6)
-- **Resume Support** - Skips already downloaded files
-- **Interactive Re-authentication** - Prompts for new cookies when session expires (no restart needed)
-- **cURL Paste Support** - Just paste the entire cURL command, cookie is extracted automatically
-- **Progress Tracking** - Shows download progress for each file with ETA
-- **Optimized Performance** - Large chunk sizes, connection pooling, and keep-alive
-- **Desktop Notifications** - Get notified when auth expires or downloads complete (Linux)
-- **Sound Alerts** - Audio alerts for auth expiry and completion
-- **Auth Expiry Warning** - Warns before session expires (~45 min) so you can refresh proactively
+- **🖥️ Modern GUI** - User-friendly graphical interface with dark theme
+- **📦 Bulk Downloads** - Automatically downloads all numbered Takeout files
+- **⚡ Parallel Downloads** - Configurable concurrent downloads (default: 4-6)
+- **🔄 Resume Support** - Skips already downloaded files
+- **🔐 Interactive Re-authentication** - Prompts for new cookies when session expires
+- **📋 cURL Paste Support** - Just paste the entire cURL command, cookie is extracted automatically
+- **📊 Progress Tracking** - Real-time progress with ETA and download speed
+- **🔔 Desktop Notifications** - Get notified when auth expires or downloads complete
+- **🔊 Sound Alerts** - Audio alerts for auth expiry and completion (CLI)
+- **⚠️ Auth Expiry Warning** - Warns before session expires (~45 min)
 
 ## Installation
 
@@ -168,6 +182,23 @@ If you prefer to put the cookie in `.env` instead of pasting cURL each time:
 
 ## Usage
 
+### GUI Application (Recommended)
+
+Launch the graphical interface:
+
+```bash
+./venv/bin/python google_takeout_gui.py
+```
+
+The GUI provides:
+- Easy paste area for cookies/cURL commands
+- Directory browser for output location
+- Real-time progress and speed display
+- Download log with color-coded status
+- Start/Stop controls
+
+### Command-Line Interface
+
 ```bash
 # Run with settings from .env
 ./venv/bin/python google_takeout_downloader.py
@@ -270,6 +301,34 @@ Total downloaded: 100.00 GB in 1:23:45
   # Press Ctrl+A, D to detach
   # screen -r takeout to reattach
   ```
+
+## Building from Source
+
+To create standalone executables:
+
+```bash
+# Install build dependencies
+pip install pyinstaller
+
+# Build for your current platform
+python build.py
+
+# Output will be in dist/ folder
+```
+
+### Automated Builds (GitHub Actions)
+
+The repository includes a GitHub Actions workflow that automatically builds executables for all platforms when you create a release tag:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+This will create a GitHub Release with binaries for:
+- Linux (x64)
+- Windows (x64)
+- macOS (x64)
 
 ## License
 
