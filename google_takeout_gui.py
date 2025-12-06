@@ -794,7 +794,8 @@ class TakeoutDownloaderGUI:
         downloads = []
         skipped = 0
         
-        for i in range(start_file, start_file + file_count):
+        # Always start from file 1, regardless of which file the URL points to
+        for i in range(1, file_count + 1):
             if self.should_stop:
                 break
                 

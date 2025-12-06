@@ -497,7 +497,8 @@ def main():
     # Build list of downloads to perform
     downloads = []
     skipped = 0
-    for i in range(start_file, start_file + args.count):
+    # Always start from file 1, regardless of which file the URL points to
+    for i in range(1, args.count + 1):
         filename = f"takeout-{batch_num}-{i:03d}{extension}"
         output_path = output_dir / filename
         

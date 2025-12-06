@@ -263,7 +263,8 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
     downloads = []
     skipped = 0
     
-    for i in range(start_file, start_file + file_count):
+    # Always start from file 1, regardless of which file the URL points to
+    for i in range(1, file_count + 1):
         filename = f"takeout-{batch_num}-{i:03d}{extension}"
         file_path = output_path / filename
         
