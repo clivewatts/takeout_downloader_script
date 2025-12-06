@@ -323,8 +323,14 @@ To create standalone executables:
 # Install build dependencies
 pip install pyinstaller
 
-# Build for your current platform
+# Build GUI app (desktop)
 python build.py
+
+# Build Web server (headless/NAS)
+python build.py --web
+
+# Build both GUI and Web
+python build.py --both
 
 # Output will be in dist/ folder
 ```
@@ -339,9 +345,16 @@ git push origin v1.0.0
 ```
 
 This will create a GitHub Release with binaries for:
-- Linux (x64)
-- Windows (x64)
-- macOS (x64)
+
+**GUI Application (Desktop)**
+- `Google_Takeout_Downloader-linux-x64`
+- `Google_Takeout_Downloader-windows-x64.exe`
+- `Google_Takeout_Downloader-macos-x64.app`
+
+**Web Server (Headless/NAS)**
+- `Google_Takeout_Web-linux-x64`
+- `Google_Takeout_Web-windows-x64.exe`
+- `Google_Takeout_Web-macos-x64`
 
 ## License
 
