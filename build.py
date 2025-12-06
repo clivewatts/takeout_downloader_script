@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
 Build script to create standalone executables for Linux, macOS, and Windows.
-Uses PyInstaller to package the GUI application.
+Uses PyInstaller to package the GUI and Web applications.
 
 Usage:
-    python build.py          # Build for current platform
-    python build.py --all    # Instructions for all platforms
+    python build.py              # Build GUI for current platform
+    python build.py --web        # Build Web server for current platform
+    python build.py --both       # Build both GUI and Web
+    python build.py --all        # Instructions for all platforms
 """
 
 import subprocess
@@ -15,10 +17,37 @@ import shutil
 from pathlib import Path
 
 # Application info
-APP_NAME = "Google Takeout Downloader"
 APP_VERSION = "1.0.0"
-SCRIPT_NAME = "google_takeout_gui.py"
 ICON_NAME = "icon"  # Will look for icon.ico (Windows), icon.icns (macOS), icon.png (Linux)
+
+# Build configurations
+BUILD_CONFIGS = {
+    'gui': {
+        'name': 'Google_Takeout_Downloader',
+        'script': 'google_takeout_gui.py',
+        'windowed': True,
+        'hidden_imports': [
+            'requests', 'urllib3',
+            'tkinter', 'tkinter.ttk', 'tkinter.filedialog',
+            'tkinter.messagebox', 'tkinter.scrolledtext',
+        ],
+        'collect_submodules': [],
+    },
+    'web': {
+        'name': 'Google_Takeout_Web',
+        'script': 'google_takeout_web.py',
+        'windowed': False,  # Console app for web server
+        'hidden_imports': [
+            'requests', 'urllib3',
+            'flask', 'flask_socketio',
+            'engineio.async_drivers.threading',
+            'jinja2', 'markupsafe',
+        ],
+        'collect_submodules': [
+            'flask', 'flask_socketio', 'engineio', 'socketio',
+        ],
+    },
+}
 
 def get_platform():
     """Get current platform."""
@@ -37,22 +66,27 @@ def install_pyinstaller():
         subprocess.run([sys.executable, "-m", "pip", "install", "pyinstaller"], check=True)
         print("✓ PyInstaller installed")
 
-def build_executable():
+def build_executable(build_type='gui'):
     """Build executable for current platform."""
+    config = BUILD_CONFIGS[build_type]
     current_platform = get_platform()
+    
     print(f"\n{'='*60}")
-    print(f"Building for {current_platform.upper()}")
+    print(f"Building {config['name']} for {current_platform.upper()}")
     print(f"{'='*60}\n")
     
     # Base PyInstaller command
     cmd = [
         sys.executable, "-m", "PyInstaller",
-        "--name", APP_NAME.replace(" ", "_"),
+        "--name", config['name'],
         "--onefile",           # Single executable
-        "--windowed",          # No console window (GUI app)
         "--clean",             # Clean build
         "--noconfirm",         # Overwrite without asking
     ]
+    
+    # Windowed mode (no console) for GUI apps
+    if config['windowed']:
+        cmd.append("--windowed")
     
     # Platform-specific options
     if current_platform == "windows":
@@ -60,33 +94,32 @@ def build_executable():
         if icon_path.exists():
             cmd.extend(["--icon", str(icon_path)])
         # Add version info for Windows
-        cmd.extend(["--version-file", "version_info.txt"]) if Path("version_info.txt").exists() else None
+        if Path("version_info.txt").exists():
+            cmd.extend(["--version-file", "version_info.txt"])
         
     elif current_platform == "macos":
         icon_path = Path("icon.icns")
         if icon_path.exists():
             cmd.extend(["--icon", str(icon_path)])
         # macOS bundle identifier
-        cmd.extend(["--osx-bundle-identifier", "com.takeout.downloader"])
+        bundle_id = "com.takeout.downloader" if build_type == 'gui' else "com.takeout.web"
+        cmd.extend(["--osx-bundle-identifier", bundle_id])
         
     elif current_platform == "linux":
         icon_path = Path("icon.png")
         if icon_path.exists():
             cmd.extend(["--icon", str(icon_path)])
     
-    # Add hidden imports that PyInstaller might miss
-    cmd.extend([
-        "--hidden-import", "requests",
-        "--hidden-import", "urllib3",
-        "--hidden-import", "tkinter",
-        "--hidden-import", "tkinter.ttk",
-        "--hidden-import", "tkinter.filedialog",
-        "--hidden-import", "tkinter.messagebox",
-        "--hidden-import", "tkinter.scrolledtext",
-    ])
+    # Add hidden imports
+    for imp in config['hidden_imports']:
+        cmd.extend(["--hidden-import", imp])
+    
+    # Add collect-submodules for Flask/SocketIO
+    for mod in config['collect_submodules']:
+        cmd.extend(["--collect-submodules", mod])
     
     # Add the main script
-    cmd.append(SCRIPT_NAME)
+    cmd.append(config['script'])
     
     print(f"Running: {' '.join(cmd)}\n")
     
@@ -95,17 +128,17 @@ def build_executable():
     
     if result.returncode == 0:
         print(f"\n{'='*60}")
-        print("✓ BUILD SUCCESSFUL!")
+        print(f"✓ BUILD SUCCESSFUL: {config['name']}")
         print(f"{'='*60}")
         
         # Show output location
         dist_path = Path("dist")
         if current_platform == "windows":
-            exe_name = f"{APP_NAME.replace(' ', '_')}.exe"
-        elif current_platform == "macos":
-            exe_name = f"{APP_NAME.replace(' ', '_')}.app"
+            exe_name = f"{config['name']}.exe"
+        elif current_platform == "macos" and config['windowed']:
+            exe_name = f"{config['name']}.app"
         else:
-            exe_name = APP_NAME.replace(" ", "_")
+            exe_name = config['name']
         
         output_file = dist_path / exe_name
         print(f"\nExecutable created at: {output_file}")
@@ -115,9 +148,14 @@ def build_executable():
                 size_mb = output_file.stat().st_size / (1024 * 1024)
                 print(f"Size: {size_mb:.1f} MB")
             print(f"\nTo run: {output_file}")
+            
+            if build_type == 'web':
+                print(f"Then open: http://localhost:5000")
+        
+        return True
     else:
-        print("\n✗ Build failed!")
-        sys.exit(1)
+        print(f"\n✗ Build failed for {config['name']}!")
+        return False
 
 def show_cross_platform_instructions():
     """Show instructions for building on all platforms."""
@@ -129,25 +167,33 @@ def show_cross_platform_instructions():
 PyInstaller creates executables for the CURRENT platform only.
 To build for all platforms, you need to run the build on each OS.
 
+BUILD OPTIONS:
+  python build.py              # Build GUI (desktop app)
+  python build.py --web        # Build Web server
+  python build.py --both       # Build both GUI and Web
+
 ┌─────────────────────────────────────────────────────────────────┐
 │ LINUX                                                           │
 ├─────────────────────────────────────────────────────────────────┤
-│ python build.py                                                 │
+│ python build.py --both                                          │
 │ Output: dist/Google_Takeout_Downloader                          │
+│         dist/Google_Takeout_Web                                 │
 └─────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────┐
 │ WINDOWS                                                         │
 ├─────────────────────────────────────────────────────────────────┤
-│ python build.py                                                 │
+│ python build.py --both                                          │
 │ Output: dist/Google_Takeout_Downloader.exe                      │
+│         dist/Google_Takeout_Web.exe                             │
 └─────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────┐
 │ macOS                                                           │
 ├─────────────────────────────────────────────────────────────────┤
-│ python build.py                                                 │
+│ python build.py --both                                          │
 │ Output: dist/Google_Takeout_Downloader.app                      │
+│         dist/Google_Takeout_Web                                 │
 └─────────────────────────────────────────────────────────────────┘
 
 ═══════════════════════════════════════════════════════════════════
@@ -158,7 +204,7 @@ For automated builds on all platforms, use GitHub Actions.
 A workflow file has been created at: .github/workflows/build.yml
 
 This will automatically:
-1. Build executables for Linux, Windows, and macOS
+1. Build GUI and Web executables for Linux, Windows, and macOS
 2. Create a GitHub Release with all binaries
 3. Trigger on version tags (e.g., v1.0.0)
 
@@ -183,8 +229,30 @@ def main():
     # Install PyInstaller if needed
     install_pyinstaller()
     
-    # Build for current platform
-    build_executable()
+    # Determine what to build
+    build_web = "--web" in sys.argv
+    build_both = "--both" in sys.argv
+    build_gui = not build_web or build_both
+    
+    success = True
+    
+    if build_gui or build_both:
+        if not build_executable('gui'):
+            success = False
+    
+    if build_web or build_both:
+        if not build_executable('web'):
+            success = False
+    
+    if success:
+        print(f"\n{'='*60}")
+        print("✓ ALL BUILDS COMPLETED SUCCESSFULLY!")
+        print(f"{'='*60}")
+    else:
+        print(f"\n{'='*60}")
+        print("✗ SOME BUILDS FAILED")
+        print(f"{'='*60}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
