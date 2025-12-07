@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Google Takeout Bulk Downloader - Simplified
-============================================
+Google Takeout Bulk Downloader
+==============================
 Downloads Google Takeout archives. Simple and robust.
 
 Usage:
-    python takeout.py                    # CLI mode (default)
-    python takeout.py --web              # Web interface  
-    python takeout.py --gui              # Desktop GUI
+    python takeout.py                    # TUI mode (default)
+    python takeout.py --web              # Web interface
+    python takeout.py --web --port 8080  # Web on custom port
 
-Approach:
-    - Keep trying to download
-    - On failure, prompt for new cURL
-    - Track known file sizes to detect incomplete downloads
-    - Clean up bad/incomplete zips and resume from last good
+Features:
+    - Parallel downloads (configurable 1-20)
+    - Auto-retry on failure with new cURL
+    - Track file sizes to detect incomplete downloads
+    - Resume from last good file
 """
 
 import os
@@ -34,7 +34,7 @@ import requests
 # CONFIGURATION & CONSTANTS
 # =============================================================================
 
-VERSION = "3.1.0"
+VERSION = "4.0.0"
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks
 DEFAULT_PARALLEL = 1
 MAX_PARALLEL = 20
@@ -537,75 +537,44 @@ class TakeoutDownloader:
 
 
 # =============================================================================
-# CLI MODE
+# MAIN ENTRY POINT
 # =============================================================================
 
-def run_cli():
-    """Run in CLI mode."""
+def main():
+    """Main entry point - TUI by default, --web for web interface."""
     import argparse
     
     parser = argparse.ArgumentParser(
-        description='Google Takeout Bulk Downloader - Simple & Robust',
+        description='Google Takeout Bulk Downloader',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s --tui                    # Terminal UI (recommended)
-  %(prog)s                          # CLI mode (sequential)
-  %(prog)s -p 5                     # 5 parallel downloads
-  %(prog)s -n 50                    # Download up to 50 files
-  %(prog)s -o /path/to/downloads    # Custom output directory
-  %(prog)s --web                    # Start web interface
+  %(prog)s                          # TUI mode (default)
+  %(prog)s --web                    # Web interface
+  %(prog)s --web --port 8080        # Web on custom port
         """
     )
     
     # Mode selection
-    mode_group = parser.add_mutually_exclusive_group()
-    mode_group.add_argument('--tui', action='store_true', help='Start terminal UI (recommended)')
-    mode_group.add_argument('--web', action='store_true', help='Start web interface')
-    mode_group.add_argument('--gui', action='store_true', help='Start desktop GUI')
-    
-    # Basic options
-    parser.add_argument('--output', '-o', default=DEFAULT_OUTPUT_DIR,
-                       help=f'Output directory (default: {DEFAULT_OUTPUT_DIR})')
-    parser.add_argument('--count', '-n', type=int, default=DEFAULT_FILE_COUNT,
-                       help=f'Max files to download (default: {DEFAULT_FILE_COUNT})')
-    parser.add_argument('--parallel', '-p', type=int, default=DEFAULT_PARALLEL,
-                       help=f'Parallel downloads 1-{MAX_PARALLEL} (default: {DEFAULT_PARALLEL})')
+    parser.add_argument('--web', action='store_true', 
+                       help='Start web interface instead of TUI')
     
     # Web options
-    parser.add_argument('--port', type=int, default=5000, help='Web server port')
-    parser.add_argument('--host', default='0.0.0.0', help='Web server host')
+    parser.add_argument('--port', type=int, default=5000, 
+                       help='Web server port (default: 5000)')
+    parser.add_argument('--host', default='0.0.0.0', 
+                       help='Web server host (default: 0.0.0.0)')
     
-    parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
+    parser.add_argument('--version', '-v', action='version', 
+                       version=f'%(prog)s {VERSION}')
     
     args = parser.parse_args()
     
-    # Handle mode selection
-    if args.tui:
-        run_tui()
-        return
-    
     if args.web:
-        run_web(args)
-        return
-    
-    if args.gui:
-        run_gui()
-        return
-    
-    # CLI mode
-    downloader = TakeoutDownloader(args.output, args.parallel)
-    
-    try:
-        downloader.run(args.count)
-    except KeyboardInterrupt:
-        print("\n\nInterrupted!")
-        downloader.stop()
+        run_web(args.host, args.port)
+    else:
+        run_tui()
 
-
-# =============================================================================
-# TUI MODE (uses separate file)
-# =============================================================================
 
 def run_tui():
     """Run terminal UI."""
@@ -613,46 +582,24 @@ def run_tui():
         from google_takeout_tui import TakeoutTUI
         app = TakeoutTUI()
         app.run()
-    except ImportError:
-        print("TUI mode requires textual. Install with: pip install textual rich")
+    except ImportError as e:
+        print(f"TUI mode requires textual: {e}")
+        print("Install with: pip install textual rich requests")
         sys.exit(1)
 
 
-# =============================================================================
-# WEB MODE (stub - uses separate file)
-# =============================================================================
-
-def run_web(args):
+def run_web(host: str, port: int):
     """Run web interface."""
     try:
-        from google_takeout_web import app, socketio
-        print(f"\n🌐 Starting web interface on http://{args.host}:{args.port}")
-        socketio.run(app, host=args.host, port=args.port, debug=False)
-    except ImportError:
-        print("Web mode requires Flask. Install with: pip install flask flask-socketio")
-        sys.exit(1)
-
-
-# =============================================================================
-# GUI MODE (stub - uses separate file)
-# =============================================================================
-
-def run_gui():
-    """Run desktop GUI."""
-    try:
-        import tkinter as tk
-        from google_takeout_gui import TakeoutDownloaderGUI
-        root = tk.Tk()
-        app = TakeoutDownloaderGUI(root)
-        root.mainloop()
+        from google_takeout_web import create_app
+        app, socketio = create_app()
+        print(f"\n🌐 Starting web interface on http://{host}:{port}")
+        socketio.run(app, host=host, port=port, debug=False, allow_unsafe_werkzeug=True)
     except ImportError as e:
-        print(f"GUI mode requires tkinter: {e}")
+        print(f"Web mode requires Flask: {e}")
+        print("Install with: pip install flask flask-socketio requests")
         sys.exit(1)
 
-
-# =============================================================================
-# MAIN ENTRY POINT
-# =============================================================================
 
 if __name__ == '__main__':
-    run_cli()
+    main()
