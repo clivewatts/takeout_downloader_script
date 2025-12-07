@@ -226,18 +226,24 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str) -> 
                             result['auth_failed'] = True
                             return result
                         
-                        # Check if first chunk matches any existing file (duplicate detection)
+                        # Check if first chunk matches any COMPLETED file (duplicate detection)
                         # Google returns file 001 for all requests when download limit is hit
+                        # Only check files that are likely complete (>1GB) to avoid false positives
+                        # with parallel downloads that are still in progress
                         output_dir = output_path.parent
                         for existing_file in output_dir.glob("*.zip"):
                             if existing_file != output_path:
                                 try:
-                                    with open(existing_file, 'rb') as ef:
-                                        existing_first = ef.read(len(chunk))
-                                        if existing_first == chunk:
-                                            result['message'] = f'Duplicate of {existing_file.name} - download limit reached (5 per file)'
-                                            result['auth_failed'] = True
-                                            return result
+                                    existing_size = existing_file.stat().st_size
+                                    # Only compare against files >1GB (likely complete)
+                                    # and with matching size (same file being returned)
+                                    if existing_size > 1_000_000_000 and existing_size == total_size:
+                                        with open(existing_file, 'rb') as ef:
+                                            existing_first = ef.read(len(chunk))
+                                            if existing_first == chunk:
+                                                result['message'] = f'Duplicate of {existing_file.name} - download limit reached (5 per file)'
+                                                result['auth_failed'] = True
+                                                return result
                                 except:
                                     pass
                     if chunk:

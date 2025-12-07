@@ -932,16 +932,20 @@ class TakeoutDownloaderGUI:
                                 self.msg_queue.put(('download_complete', filename, False))
                                 return (False, "Not a valid ZIP file (wrong magic bytes)", True)
                             
-                            # Check if first chunk matches any existing file (duplicate detection)
+                            # Check if first chunk matches any COMPLETED file (duplicate detection)
                             # Google returns file 001 for all requests when download limit is hit
+                            # Only check files that are likely complete (>1GB) to avoid false positives
                             for existing_file in output_path.parent.glob("*.zip"):
                                 if existing_file != output_path:
                                     try:
-                                        with open(existing_file, 'rb') as ef:
-                                            existing_first = ef.read(len(chunk))
-                                            if existing_first == chunk:
-                                                self.msg_queue.put(('download_complete', filename, False))
-                                                return (False, f"Duplicate of {existing_file.name} - download limit reached", True)
+                                        existing_size = existing_file.stat().st_size
+                                        # Only compare against files >1GB and matching size
+                                        if existing_size > 1_000_000_000 and existing_size == total_size:
+                                            with open(existing_file, 'rb') as ef:
+                                                existing_first = ef.read(len(chunk))
+                                                if existing_first == chunk:
+                                                    self.msg_queue.put(('download_complete', filename, False))
+                                                    return (False, f"Duplicate of {existing_file.name} - download limit reached", True)
                                     except:
                                         pass
                         if chunk:
