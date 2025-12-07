@@ -194,11 +194,13 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
 
 
 def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_count: int):
-    """Run the download process - sequential with auth retry."""
+    """Run the download process with parallel downloads."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     global download_state
     
     with state_lock:
         download_state['is_running'] = True
+        download_state['should_stop'] = False
         download_state['cookie'] = cookie
         download_state['stats'] = {
             'total_files': file_count,
@@ -211,7 +213,7 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
         download_state['files'] = []
         download_state['log'] = []
     
-    add_log('Starting downloads...', 'info')
+    add_log(f'Starting downloads (parallel: {parallel})...', 'info')
     emit_status('download_started', {'message': 'Starting downloads...'})
     
     # Parse URL
@@ -231,69 +233,94 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
     add_log(f'Output: {output_dir}', 'info')
     add_log(f'URL pattern: {base_url}XXX{extension}', 'info')
     
-    current_file = 1
-    consecutive_404 = 0
+    auth_failed = False
     
-    while current_file <= file_count:
+    while not auth_failed:
         with state_lock:
             if download_state['should_stop']:
                 break
             current_cookie = download_state['cookie']
         
-        # Build filename and URL
-        filename = f"{base_url.split('/')[-1]}{current_file:03d}{extension}"
-        filepath = output_path / filename
-        file_url = f"{base_url}{current_file:03d}{extension}"
-        if query_string:
-            file_url += f"?{query_string}"
-        
-        # Skip existing files
-        if filepath.exists() and filepath.stat().st_size > 0:
-            expected = size_history.get_expected_size(filename)
-            if not expected or filepath.stat().st_size >= expected:
-                add_log(f"✓ {filename} (exists)", 'info')
-                with state_lock:
-                    download_state['stats']['skipped_files'] += 1
-                current_file += 1
-                consecutive_404 = 0
-                emit_status('stats_update', download_state['stats'])
-                continue
-        
-        # Download
-        result = download_file(file_url, filepath, current_file - 1, current_cookie, size_history)
-        
-        if result['success']:
-            add_log(f"✓ {filename} ({result['size']/(1024*1024):.1f} MB)", 'success')
-            with state_lock:
-                download_state['stats']['completed_files'] += 1
-            current_file += 1
-            consecutive_404 = 0
+        # Build list of files to download
+        to_download = []
+        for num in range(1, file_count + 1):
+            filename = f"{base_url.split('/')[-1]}{num:03d}{extension}"
+            filepath = output_path / filename
             
-        elif result['auth_failed']:
-            add_log(f"✗ {filename}: {result['message']}", 'error')
+            # Skip existing files
+            if filepath.exists() and filepath.stat().st_size > 0:
+                expected = size_history.get_expected_size(filename)
+                if not expected or filepath.stat().st_size >= expected:
+                    with state_lock:
+                        download_state['stats']['skipped_files'] += 1
+                    continue
+            
+            file_url = f"{base_url}{num:03d}{extension}"
+            if query_string:
+                file_url += f"?{query_string}"
+            to_download.append((num, file_url, filepath, filename))
+        
+        if not to_download:
+            add_log('All files already downloaded!', 'success')
+            break
+        
+        add_log(f'Downloading {len(to_download)} files...', 'info')
+        emit_status('stats_update', download_state['stats'])
+        
+        # Parallel downloads
+        with ThreadPoolExecutor(max_workers=parallel) as executor:
+            futures = {
+                executor.submit(download_file, url, path, idx, current_cookie, size_history): (idx, name)
+                for idx, url, path, name in to_download
+            }
+            
+            for future in as_completed(futures):
+                with state_lock:
+                    if download_state['should_stop']:
+                        break
+                
+                idx, filename = futures[future]
+                
+                try:
+                    result = future.result()
+                    
+                    if result['success']:
+                        add_log(f"✓ {filename} ({result['size']/(1024*1024):.1f} MB)", 'success')
+                        with state_lock:
+                            download_state['stats']['completed_files'] += 1
+                            
+                    elif result['auth_failed']:
+                        add_log(f"✗ {filename}: {result['message']}", 'error')
+                        auth_failed = True
+                        # Cancel remaining futures
+                        for f in futures:
+                            f.cancel()
+                        break
+                        
+                    elif 'not found' in result['message'].lower() or '404' in result['message']:
+                        add_log(f"⊘ {filename}: not found", 'warning')
+                        
+                    else:
+                        add_log(f"✗ {filename}: {result['message']}", 'error')
+                        with state_lock:
+                            download_state['stats']['failed_files'] += 1
+                            
+                except Exception as e:
+                    add_log(f"✗ {filename}: {e}", 'error')
+                    with state_lock:
+                        download_state['stats']['failed_files'] += 1
+                
+                emit_status('stats_update', download_state['stats'])
+        
+        if auth_failed:
             add_log('⚠️ Authentication needed - provide new cURL', 'warning')
             emit_status('auth_required', {'message': 'Auth expired. Provide new cURL.'})
-            # Wait for new cookie (user will call /api/update_cookie)
             with state_lock:
                 download_state['is_running'] = False
             return
-            
-        elif 'not found' in result['message'].lower() or '404' in result['message']:
-            consecutive_404 += 1
-            add_log(f"✗ {filename}: not found", 'warning')
-            if consecutive_404 >= 3:
-                add_log('3 consecutive 404s - assuming done', 'info')
-                break
-            current_file += 1
-            
-        else:
-            add_log(f"✗ {filename}: {result['message']}", 'error')
-            with state_lock:
-                download_state['stats']['failed_files'] += 1
-            current_file += 1
-            consecutive_404 = 0
         
-        emit_status('stats_update', download_state['stats'])
+        # Done with this batch
+        break
     
     with state_lock:
         stats = download_state['stats']

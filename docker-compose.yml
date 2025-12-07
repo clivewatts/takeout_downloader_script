@@ -9,7 +9,7 @@ services:
       - "5000:5000"
     volumes:
       # Mount your downloads directory (change path as needed)
-      - ./downloads:/downloads
+      - /smb/takeout:/downloads
     environment:
       - OUTPUT_DIR=/downloads
       - PARALLEL_DOWNLOADS=6
