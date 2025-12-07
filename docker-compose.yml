@@ -5,9 +5,6 @@ services:
     build: .
     container_name: takeout-downloader
     restart: unless-stopped
-    # Run as current user to avoid permission issues with mounted volumes
-    # Set UID/GID in .env or export before running: export UID=$(id -u) GID=$(id -g)
-    user: "${UID:-1000}:${GID:-1000}"
     ports:
       - "5000:5000"
     volumes:
