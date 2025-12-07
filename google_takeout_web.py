@@ -1,40 +1,29 @@
 #!/usr/bin/env python3
 """
 Google Takeout Bulk Downloader - Web Version
-A web interface for downloading Google Takeout archives in headless environments.
+A web interface for downloading Google Takeout archives.
 
 This module can be run standalone or launched via: python takeout.py --web
 """
 
 import os
-import re
 import sys
 import threading
 import time
-import json
 from pathlib import Path
-from datetime import datetime, timedelta
-from typing import Optional, Dict, List
-from dataclasses import dataclass, asdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from datetime import datetime
+from typing import Optional
 
 from flask import Flask, render_template_string, request, jsonify
 from flask_socketio import SocketIO, emit
 
-# Import shared core (if available)
-try:
-    from takeout import (
-        DownloadConfig, DownloadStats, DownloadProgress, NotificationConfig,
-        DownloadEngine, extract_url_parts, extract_cookie_from_curl, 
-        extract_url_from_curl, verify_zip_file, VERSION
-    )
-    USING_SHARED_CORE = True
-except ImportError:
-    USING_SHARED_CORE = False
-    VERSION = "1.5.0"
+# Import shared core
+from takeout import (
+    TakeoutDownloader, SizeHistory, DownloadStats,
+    extract_url_parts, extract_cookie_from_curl, extract_url_from_curl,
+    VERSION, CHUNK_SIZE
+)
+import requests
 
 # ============================================================================
 # CONFIGURATION
@@ -73,77 +62,8 @@ state_lock = threading.Lock()
 MAX_LOG_ENTRIES = 500  # Limit log buffer size
 
 # ============================================================================
-# DOWNLOAD ENGINE
+# DOWNLOAD ENGINE - Uses shared core from takeout.py
 # ============================================================================
-
-CHUNK_SIZE = 1024 * 1024  # 1MB chunks
-
-# Fallback functions if shared core not available
-if not USING_SHARED_CORE:
-    def extract_url_parts(url: str) -> tuple:
-        """Extract URL parts for Google Takeout pattern."""
-        if '?' in url:
-            url_path, query_string = url.split('?', 1)
-        else:
-            url_path, query_string = url, ''
-        
-        match = re.search(r'(.*takeout-[^-]+-)(\d+)-(\d+)(\.\w+)$', url_path)
-        if not match:
-            return None, None, None, None, None
-        
-        base = match.group(1)
-        batch_num = int(match.group(2))
-        file_num = int(match.group(3))
-        ext = match.group(4)
-        
-        return base, batch_num, file_num, ext, query_string
-
-    def extract_cookie_from_curl(curl_text: str) -> str:
-        """Extract cookie value from a cURL command or raw cookie string."""
-        if 'curl' in curl_text.lower() or "-H 'Cookie:" in curl_text or '-H "Cookie:' in curl_text:
-            match = re.search(r"-H\s*['\"]Cookie:\s*([^'\"]+)['\"]", curl_text, re.IGNORECASE)
-            if match:
-                return match.group(1).strip()
-        
-        if curl_text.lower().startswith('cookie:'):
-            return curl_text[7:].strip()
-        
-        cookie = curl_text.strip()
-        if (cookie.startswith("'") and cookie.endswith("'")) or \
-           (cookie.startswith('"') and cookie.endswith('"')):
-            cookie = cookie[1:-1]
-        
-        return cookie
-
-    def extract_url_from_curl(curl_text: str) -> str:
-        """Extract the download URL from a cURL command."""
-        match = re.search(r"curl\s+['\"]?(https?://[^'\"\s]+)['\"]?", curl_text, re.IGNORECASE)
-        if match:
-            url = match.group(1)
-            if 'takeout' in url.lower():
-                return url
-        return None
-
-def create_fast_session(cookie: str) -> requests.Session:
-    """Create an optimized session for fast downloads."""
-    session = requests.Session()
-    
-    adapter = HTTPAdapter(
-        pool_connections=10,
-        pool_maxsize=10,
-        max_retries=Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
-    )
-    session.mount('https://', adapter)
-    session.mount('http://', adapter)
-    
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        'Accept': '*/*',
-        'Accept-Encoding': 'identity',
-        'Connection': 'keep-alive',
-        'Cookie': cookie,
-    })
-    return session
 
 def emit_status(event: str, data: dict):
     """Emit status update to all connected clients."""
@@ -164,9 +84,8 @@ def add_log(message: str, log_type: str = 'info'):
             download_state['log'] = download_state['log'][-MAX_LOG_ENTRIES:]
     socketio.emit('log_entry', entry)
 
-def download_file(url: str, output_path: Path, file_index: int, cookie: str) -> dict:
+def download_file(url: str, output_path: Path, file_index: int, cookie: str, size_history: SizeHistory) -> dict:
     """Download a single file with progress tracking."""
-    session = create_fast_session(cookie)
     filename = output_path.name
     result = {
         'index': file_index,
@@ -178,115 +97,111 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str) -> 
     }
     
     try:
-        with session.get(url, stream=True, allow_redirects=True, timeout=(10, 300)) as r:
-            r.raise_for_status()
-            
-            content_type = r.headers.get('content-type', '')
-            if 'text/html' in content_type:
-                preview = r.content[:500].decode('utf-8', errors='ignore')
-                if 'signin' in preview.lower() or 'login' in preview.lower():
-                    result['message'] = 'Auth failed - cookies invalid/expired'
-                    result['auth_failed'] = True
-                    return result
-                result['message'] = 'Got HTML instead of ZIP'
-                result['auth_failed'] = True
-                return result
-            
-            total_size = int(r.headers.get('content-length', 0))
-            
-            if total_size < 1000000:
-                result['message'] = f'File too small ({total_size} bytes) - likely auth failure'
-                result['auth_failed'] = True
-                return result
-            
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            emit_status('file_start', {
-                'index': file_index,
-                'filename': filename,
-                'size': total_size,
-            })
-            
-            downloaded = 0
-            last_emit_time = time.time()
-            first_chunk = True
-            
-            with open(output_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
-                    # Validate first chunk is a ZIP file (starts with PK magic bytes)
-                    if first_chunk and chunk:
-                        first_chunk = False
-                        if not chunk[:2] == b'PK':
-                            # Not a ZIP file - likely auth redirect or error page
-                            preview = chunk[:500].decode('utf-8', errors='ignore').lower()
-                            if 'signin' in preview or 'login' in preview or 'accounts.google' in preview:
-                                result['message'] = 'Auth failed - redirected to login'
-                            else:
-                                result['message'] = 'Not a valid ZIP file (wrong magic bytes)'
-                            result['auth_failed'] = True
-                            return result
-                        
-                        # Check if first chunk matches any COMPLETED file (duplicate detection)
-                        # Google returns file 001 for all requests when download limit is hit
-                        # Only check files that are likely complete (>1GB) to avoid false positives
-                        # with parallel downloads that are still in progress
-                        output_dir = output_path.parent
-                        for existing_file in output_dir.glob("*.zip"):
-                            if existing_file != output_path:
-                                try:
-                                    existing_size = existing_file.stat().st_size
-                                    # Only compare against files >1GB (likely complete)
-                                    # and with matching size (same file being returned)
-                                    if existing_size > 1_000_000_000 and existing_size == total_size:
-                                        with open(existing_file, 'rb') as ef:
-                                            existing_first = ef.read(len(chunk))
-                                            if existing_first == chunk:
-                                                result['message'] = f'Duplicate of {existing_file.name} - download limit reached (5 per file)'
-                                                result['auth_failed'] = True
-                                                return result
-                                except:
-                                    pass
-                    if chunk:
-                        f.write(chunk)
-                        chunk_len = len(chunk)
-                        downloaded += chunk_len
-                        
-                        # Update global stats
-                        with state_lock:
-                            download_state['stats']['bytes_downloaded'] += chunk_len
-                        
-                        # Emit progress every 500ms
-                        now = time.time()
-                        if now - last_emit_time >= 0.5:
-                            percent = int((downloaded / total_size) * 100) if total_size > 0 else 0
-                            emit_status('file_progress', {
-                                'index': file_index,
-                                'filename': filename,
-                                'downloaded': downloaded,
-                                'total': total_size,
-                                'percent': percent,
-                            })
-                            last_emit_time = now
-            
-            result['success'] = True
-            result['message'] = 'Complete'
-            result['size'] = total_size
+        response = requests.get(
+            url,
+            headers={
+                'Cookie': cookie,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            },
+            stream=True,
+            timeout=(10, 300),
+        )
+        
+        # Check for auth failure
+        if response.status_code in (401, 403):
+            result['message'] = 'Auth failed'
+            result['auth_failed'] = True
             return result
-            
+        
+        if 'accounts.google' in response.url:
+            result['message'] = 'Auth failed - redirected to login'
+            result['auth_failed'] = True
+            return result
+        
+        response.raise_for_status()
+        
+        content_type = response.headers.get('content-type', '')
+        if 'text/html' in content_type:
+            result['message'] = 'Auth failed - got HTML'
+            result['auth_failed'] = True
+            return result
+        
+        total_size = int(response.headers.get('content-length', 0))
+        if total_size < 1000:
+            result['message'] = 'Auth failed - file too small'
+            result['auth_failed'] = True
+            return result
+        
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        emit_status('file_start', {
+            'index': file_index,
+            'filename': filename,
+            'size': total_size,
+        })
+        
+        temp_path = output_path.with_suffix('.downloading')
+        downloaded = 0
+        last_emit_time = time.time()
+        
+        with open(temp_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                if chunk:
+                    # Check first chunk for ZIP magic
+                    if downloaded == 0 and chunk[:2] != b'PK':
+                        temp_path.unlink()
+                        result['message'] = 'Auth failed - not a ZIP'
+                        result['auth_failed'] = True
+                        return result
+                    
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    
+                    with state_lock:
+                        download_state['stats']['bytes_downloaded'] += len(chunk)
+                    
+                    # Emit progress every 500ms
+                    now = time.time()
+                    if now - last_emit_time >= 0.5:
+                        percent = int((downloaded / total_size) * 100) if total_size > 0 else 0
+                        emit_status('file_progress', {
+                            'index': file_index,
+                            'filename': filename,
+                            'downloaded': downloaded,
+                            'total': total_size,
+                            'percent': percent,
+                        })
+                        last_emit_time = now
+        
+        # Rename to final
+        temp_path.rename(output_path)
+        size_history.record_size(filename, downloaded)
+        
+        result['success'] = True
+        result['message'] = 'Complete'
+        result['size'] = downloaded
+        return result
+        
+    except requests.exceptions.HTTPError as e:
+        if e.response and e.response.status_code == 404:
+            result['message'] = 'File not found (404)'
+            return result
+        result['message'] = f'HTTP error: {e}'
+        return result
     except requests.exceptions.RequestException as e:
-        if output_path.exists():
-            output_path.unlink()
-        result['message'] = str(e)
+        result['message'] = f'Network error: {e}'
         return result
 
+
 def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_count: int):
-    """Run the download process."""
+    """Run the download process - sequential with auth retry."""
     global download_state
     
     with state_lock:
         download_state['is_running'] = True
+        download_state['cookie'] = cookie
         download_state['stats'] = {
-            'total_files': 0,
+            'total_files': file_count,
             'completed_files': 0,
             'failed_files': 0,
             'skipped_files': 0,
@@ -294,142 +209,96 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
             'start_time': datetime.now().isoformat(),
         }
         download_state['files'] = []
-        download_state['log'] = []  # Clear log for new session
+        download_state['log'] = []
     
     add_log('Starting downloads...', 'info')
     emit_status('download_started', {'message': 'Starting downloads...'})
     
     # Parse URL
-    base_url, batch_num, start_file, extension, query_string = extract_url_parts(url)
+    base_url, file_num, extension, query_string = extract_url_parts(url)
     
     if base_url is None:
-        add_log('Invalid URL format. Expected: takeout-TIMESTAMP-N-NNN.zip', 'error')
-        emit_status('error', {'message': 'Invalid URL format. Expected: takeout-TIMESTAMP-N-NNN.zip'})
+        add_log('Invalid URL format', 'error')
+        emit_status('error', {'message': 'Invalid URL format'})
         with state_lock:
             download_state['is_running'] = False
         return
     
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+    size_history = SizeHistory(output_dir)
     
-    # Build download list
-    downloads = []
-    skipped = 0
+    add_log(f'Output: {output_dir}', 'info')
+    add_log(f'URL pattern: {base_url}XXX{extension}', 'info')
     
-    # Always start from file 1, regardless of which file the URL points to
-    for i in range(1, file_count + 1):
-        filename = f"takeout-{batch_num}-{i:03d}{extension}"
-        file_path = output_path / filename
+    current_file = 1
+    consecutive_404 = 0
+    
+    while current_file <= file_count:
+        with state_lock:
+            if download_state['should_stop']:
+                break
+            current_cookie = download_state['cookie']
         
-        if file_path.exists():
-            skipped += 1
-            continue
-        
-        current_url = f"{base_url}{batch_num}-{i:03d}{extension}"
+        # Build filename and URL
+        filename = f"{base_url.split('/')[-1]}{current_file:03d}{extension}"
+        filepath = output_path / filename
+        file_url = f"{base_url}{current_file:03d}{extension}"
         if query_string:
-            current_url += f"?{query_string}"
+            file_url += f"?{query_string}"
         
-        downloads.append({
-            'index': len(downloads),
-            'url': current_url,
-            'path': file_path,
-            'filename': filename,
-            'status': 'pending',
-        })
-    
-    with state_lock:
-        download_state['stats']['total_files'] = len(downloads)
-        download_state['stats']['skipped_files'] = skipped
-        download_state['files'] = [{'filename': d['filename'], 'status': 'pending'} for d in downloads]
-    
-    add_log(f'Found {len(downloads)} files to download ({skipped} skipped)', 'info')
-    emit_status('download_info', {
-        'total': len(downloads),
-        'skipped': skipped,
-        'batch': batch_num,
-        'start_file': start_file,
-    })
-    
-    if not downloads:
-        add_log(f'All {skipped} files already exist!', 'success')
-        emit_status('download_complete', {
-            'message': f'All {skipped} files already exist!',
-            'stats': download_state['stats'],
-        })
-        with state_lock:
-            download_state['is_running'] = False
-        return
-    
-    # Run downloads in parallel
-    auth_failed = False
-    
-    # Reset stop flag
-    with state_lock:
-        download_state['should_stop'] = False
-    
-    with ThreadPoolExecutor(max_workers=parallel) as executor:
-        futures = {
-            executor.submit(download_file, d['url'], d['path'], d['index'], cookie): d
-            for d in downloads
-        }
-        
-        for future in as_completed(futures):
-            # Check if we should stop (auth failed or user cancelled)
-            with state_lock:
-                if download_state['should_stop'] or auth_failed:
-                    # Cancel remaining futures
-                    for f in futures:
-                        f.cancel()
-                    break
-                
-            result = future.result()
-            
-            with state_lock:
-                if result['success']:
-                    download_state['stats']['completed_files'] += 1
-                    download_state['files'][result['index']]['status'] = 'complete'
-                else:
-                    download_state['stats']['failed_files'] += 1
-                    download_state['files'][result['index']]['status'] = 'failed'
-                    
-                    if result['auth_failed']:
-                        auth_failed = True
-                        download_state['should_stop'] = True  # Signal other downloads to stop
-            
-            # Log file completion
-            if result['success']:
-                size_str = f"{result['size'] / (1024*1024*1024):.2f} GB" if result['size'] > 0 else ''
-                add_log(f"✓ {result['filename']} complete ({size_str})", 'success')
-            else:
-                add_log(f"✗ {result['filename']}: {result['message']}", 'error')
-            
-            emit_status('file_complete', {
-                'index': result['index'],
-                'filename': result['filename'],
-                'success': result['success'],
-                'message': result['message'],
-                'size': result['size'],
-            })
-            
-            # Emit overall stats
-            with state_lock:
+        # Skip existing files
+        if filepath.exists() and filepath.stat().st_size > 0:
+            expected = size_history.get_expected_size(filename)
+            if not expected or filepath.stat().st_size >= expected:
+                add_log(f"✓ {filename} (exists)", 'info')
+                with state_lock:
+                    download_state['stats']['skipped_files'] += 1
+                current_file += 1
+                consecutive_404 = 0
                 emit_status('stats_update', download_state['stats'])
-    
-    if auth_failed:
-        add_log('⚠️ Authentication expired. Please provide a new cookie.', 'warning')
-        emit_status('auth_required', {
-            'message': 'Authentication expired. Please provide a new cookie.',
-        })
-    else:
-        with state_lock:
-            stats = download_state['stats']
-            add_log(f"🎉 All downloads finished! {stats['completed_files']} completed, {stats['failed_files']} failed", 'success')
-            emit_status('download_complete', {
-                'message': 'All downloads finished!',
-                'stats': stats,
-            })
+                continue
+        
+        # Download
+        result = download_file(file_url, filepath, current_file - 1, current_cookie, size_history)
+        
+        if result['success']:
+            add_log(f"✓ {filename} ({result['size']/(1024*1024):.1f} MB)", 'success')
+            with state_lock:
+                download_state['stats']['completed_files'] += 1
+            current_file += 1
+            consecutive_404 = 0
+            
+        elif result['auth_failed']:
+            add_log(f"✗ {filename}: {result['message']}", 'error')
+            add_log('⚠️ Authentication needed - provide new cURL', 'warning')
+            emit_status('auth_required', {'message': 'Auth expired. Provide new cURL.'})
+            # Wait for new cookie (user will call /api/update_cookie)
+            with state_lock:
+                download_state['is_running'] = False
+            return
+            
+        elif 'not found' in result['message'].lower() or '404' in result['message']:
+            consecutive_404 += 1
+            add_log(f"✗ {filename}: not found", 'warning')
+            if consecutive_404 >= 3:
+                add_log('3 consecutive 404s - assuming done', 'info')
+                break
+            current_file += 1
+            
+        else:
+            add_log(f"✗ {filename}: {result['message']}", 'error')
+            with state_lock:
+                download_state['stats']['failed_files'] += 1
+            current_file += 1
+            consecutive_404 = 0
+        
+        emit_status('stats_update', download_state['stats'])
     
     with state_lock:
+        stats = download_state['stats']
+        add_log(f"🎉 Done! {stats['completed_files']} completed, {stats['skipped_files']} skipped, {stats['failed_files']} failed", 'success')
+        emit_status('download_complete', {'message': 'Done!', 'stats': stats})
         download_state['is_running'] = False
 
 # ============================================================================
