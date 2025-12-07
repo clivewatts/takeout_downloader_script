@@ -549,7 +549,8 @@ def run_cli():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                          # Interactive mode (sequential)
+  %(prog)s --tui                    # Terminal UI (recommended)
+  %(prog)s                          # CLI mode (sequential)
   %(prog)s -p 5                     # 5 parallel downloads
   %(prog)s -n 50                    # Download up to 50 files
   %(prog)s -o /path/to/downloads    # Custom output directory
@@ -559,6 +560,7 @@ Examples:
     
     # Mode selection
     mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument('--tui', action='store_true', help='Start terminal UI (recommended)')
     mode_group.add_argument('--web', action='store_true', help='Start web interface')
     mode_group.add_argument('--gui', action='store_true', help='Start desktop GUI')
     
@@ -579,6 +581,10 @@ Examples:
     args = parser.parse_args()
     
     # Handle mode selection
+    if args.tui:
+        run_tui()
+        return
+    
     if args.web:
         run_web(args)
         return
@@ -595,6 +601,21 @@ Examples:
     except KeyboardInterrupt:
         print("\n\nInterrupted!")
         downloader.stop()
+
+
+# =============================================================================
+# TUI MODE (uses separate file)
+# =============================================================================
+
+def run_tui():
+    """Run terminal UI."""
+    try:
+        from google_takeout_tui import TakeoutTUI
+        app = TakeoutTUI()
+        app.run()
+    except ImportError:
+        print("TUI mode requires textual. Install with: pip install textual rich")
+        sys.exit(1)
 
 
 # =============================================================================
