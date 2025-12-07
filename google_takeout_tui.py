@@ -77,10 +77,10 @@ class FileProgress(Static):
     
     def __init__(self):
         super().__init__()
-        self.filename = ""
-        self.percent = 0
-        self.size = 0
-        self.downloaded = 0
+        self.current_filename = ""
+        self.current_percent = 0
+        self.total_size = 0
+        self.bytes_downloaded = 0
     
     def compose(self) -> ComposeResult:
         yield Static("", id="file-name")
@@ -88,10 +88,10 @@ class FileProgress(Static):
         yield Static("", id="file-size")
     
     def update_progress(self, filename: str, percent: int, downloaded: int, total: int):
-        self.filename = filename
-        self.percent = percent
-        self.downloaded = downloaded
-        self.size = total
+        self.current_filename = filename
+        self.current_percent = percent
+        self.bytes_downloaded = downloaded
+        self.total_size = total
         
         name_widget = self.query_one("#file-name", Static)
         progress_widget = self.query_one("#file-progress", ProgressBar)
