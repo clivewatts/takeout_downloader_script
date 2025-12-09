@@ -8,7 +8,7 @@
 
 A simple, robust tool to bulk download Google Takeout archives. Available as **TUI** (Terminal UI) and **Web interface**.
 
-![Version](https://img.shields.io/badge/Version-4.0.0-blue) ![TUI](https://img.shields.io/badge/TUI-Default-green) ![Web](https://img.shields.io/badge/Web-Available-blue) ![Docker](https://img.shields.io/badge/Docker-Ready-2496ED) ![Python](https://img.shields.io/badge/Python-3.8+-blue) ![Platform](https://img.shields.io/badge/Platform-Linux%20|%20Windows%20|%20macOS-orange)
+![Version](https://img.shields.io/badge/Version-4.2.0-blue) ![TUI](https://img.shields.io/badge/TUI-Default-green) ![Web](https://img.shields.io/badge/Web-Available-blue) ![Docker](https://img.shields.io/badge/Docker-Ready-2496ED) ![Python](https://img.shields.io/badge/Python-3.8+-blue) ![Platform](https://img.shields.io/badge/Platform-Linux%20|%20Windows%20|%20macOS-orange)
 
 ## Features
 
@@ -16,6 +16,7 @@ A simple, robust tool to bulk download Google Takeout archives. Available as **T
 - **Auto-Retry** - On auth failure, prompts for new cURL and resumes
 - **Resume Support** - Tracks file sizes to detect incomplete downloads
 - **Simple** - Just paste your cURL command and go
+- **PowerShell Support** - Works with both bash cURL and PowerShell Invoke-WebRequest
 
 ## Quick Start
 
@@ -68,8 +69,8 @@ pip install -r requirements.txt
 1. Go to [Google Takeout](https://takeout.google.com) → **Manage exports**
 2. Open DevTools (`F12`) → **Network** tab
 3. Click **Download** on any file
-4. Right-click the request → **Copy** → **Copy as cURL**
-5. Paste into the app
+4. Right-click the request → **Copy** → **Copy as cURL** (or **Copy as PowerShell**)
+5. Paste into the app (both bash and PowerShell formats supported)
 
 ### TUI Mode
 

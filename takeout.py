@@ -34,7 +34,7 @@ import requests
 # CONFIGURATION & CONSTANTS
 # =============================================================================
 
-VERSION = "4.0.0"
+VERSION = "4.2.0"
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks
 DEFAULT_PARALLEL = 1
 MAX_PARALLEL = 20
@@ -129,8 +129,59 @@ def extract_url_parts(url: str) -> Tuple[Optional[str], Optional[int], Optional[
     return base, file_num, ext, query_string
 
 
+def extract_cookies_from_powershell(ps_text: str) -> str:
+    """Extract cookies from PowerShell Invoke-WebRequest format.
+    
+    Parses lines like:
+    $session.Cookies.Add((New-Object System.Net.Cookie("NAME", "VALUE", "/", "domain")))
+    
+    Returns a cookie string in the format: NAME=VALUE; NAME2=VALUE2
+    """
+    cookies = []
+    # Match: New-Object System.Net.Cookie("NAME", "VALUE", ...)
+    # The cookie name and value are the first two string arguments
+    pattern = r'New-Object\s+System\.Net\.Cookie\s*\(\s*["\']([^"\']+)["\']\s*,\s*["\']([^"\']*)["\']'
+    
+    for match in re.finditer(pattern, ps_text, re.IGNORECASE):
+        name = match.group(1)
+        value = match.group(2)
+        cookies.append(f"{name}={value}")
+    
+    return "; ".join(cookies)
+
+
+def extract_url_from_powershell(ps_text: str) -> Optional[str]:
+    """Extract the download URL from a PowerShell Invoke-WebRequest command.
+    
+    Looks for: Invoke-WebRequest ... -Uri "URL"
+    """
+    # Match -Uri "URL" or -Uri 'URL'
+    match = re.search(r'-Uri\s+["\']?(https?://[^"\'\'\s`]+)["\']?', ps_text, re.IGNORECASE)
+    if match:
+        url = match.group(1)
+        if 'takeout' in url.lower():
+            return url
+    return None
+
+
+def is_powershell_format(text: str) -> bool:
+    """Check if the input appears to be PowerShell format."""
+    ps_indicators = [
+        'Invoke-WebRequest',
+        'New-Object System.Net.Cookie',
+        '$session',
+        'WebRequestSession',
+        '-WebSession',
+    ]
+    return any(indicator in text for indicator in ps_indicators)
+
+
 def extract_cookie_from_curl(curl_text: str) -> str:
-    """Extract cookie value from a cURL command or raw cookie string."""
+    """Extract cookie value from a cURL command, PowerShell command, or raw cookie string."""
+    # Check if this is PowerShell format
+    if is_powershell_format(curl_text):
+        return extract_cookies_from_powershell(curl_text)
+    
     # Try to find Cookie header in cURL command
     match = re.search(r"-H\s*['\"]Cookie:\s*([^'\"]+)['\"]", curl_text, re.IGNORECASE)
     if match:
@@ -150,7 +201,12 @@ def extract_cookie_from_curl(curl_text: str) -> str:
 
 
 def extract_url_from_curl(curl_text: str) -> Optional[str]:
-    """Extract the download URL from a cURL command."""
+    """Extract the download URL from a cURL or PowerShell command."""
+    # Check if this is PowerShell format
+    if is_powershell_format(curl_text):
+        return extract_url_from_powershell(curl_text)
+    
+    # Standard cURL format
     match = re.search(r"curl\s+['\"]?(https?://[^'\"\s]+)['\"]?", curl_text, re.IGNORECASE)
     if match:
         url = match.group(1)
@@ -436,6 +492,7 @@ class TakeoutDownloader:
         print("2. Open DevTools (F12) -> Network tab")
         print("3. Click any download link")
         print("4. Right-click the request -> Copy -> Copy as cURL")
+        print("   (PowerShell format also supported)")
         print("\nPaste the cURL command (or 'q' to quit):")
         print("-" * 60)
         

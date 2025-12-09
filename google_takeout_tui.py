@@ -137,7 +137,7 @@ class TakeoutTUI(App):
         with Container(id="main-container"):
             # Input section
             with Vertical(id="input-section"):
-                yield Label("[bold]Paste cURL command:[/]")
+                yield Label("[bold]Paste cURL command (bash or PowerShell):[/]")
                 yield TextArea(id="curl-input")
                 
                 with Horizontal(id="settings-row"):

@@ -678,8 +678,8 @@ HTML_TEMPLATE = '''
             
             <div class="form-group">
                 <label for="curl-input">cURL Command or Cookie</label>
-                <textarea id="curl-input" placeholder="Paste the full cURL command from Chrome DevTools, or just the cookie value..."></textarea>
-                <p class="help-text">Right-click a download request in DevTools Network tab → Copy → Copy as cURL</p>
+                <textarea id="curl-input" placeholder="Paste the full cURL command from Chrome DevTools (bash or PowerShell format), or just the cookie value..."></textarea>
+                <p class="help-text">Right-click a download request in DevTools Network tab → Copy → Copy as cURL (bash) or Copy as PowerShell</p>
             </div>
             
             <div class="form-group">
