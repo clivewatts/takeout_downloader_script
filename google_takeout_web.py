@@ -967,6 +967,7 @@ HTML_TEMPLATE = '''
         
         socket.on('stats_update', (stats) => {
             document.getElementById('stat-complete').textContent = stats.completed_files;
+            document.getElementById('stat-total').textContent = stats.total_files;
             document.getElementById('stat-failed').textContent = stats.failed_files;
             document.getElementById('stat-skipped').textContent = stats.skipped_files;
             document.getElementById('stat-size').textContent = formatBytes(stats.bytes_downloaded);
