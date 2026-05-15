@@ -83,6 +83,16 @@ def add_log(message: str, log_type: str = 'info'):
             download_state['log'] = download_state['log'][-MAX_LOG_ENTRIES:]
     socketio.emit('log_entry', entry)
 
+def update_file_state(file_index, status, percent=None):
+    """Update a file's status in download_state for reconnecting clients."""
+    with state_lock:
+        for fe in download_state['files']:
+            if fe['index'] == file_index:
+                fe['status'] = status
+                if percent is not None:
+                    fe['percent'] = percent
+                break
+
 def download_file(url: str, output_path: Path, file_index: int, cookie: str, size_history: SizeHistory, extension: str = ".zip") -> dict:
     """Download a single file with progress tracking and resume support."""
     filename = output_path.name
@@ -176,6 +186,19 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
         
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
+        # Track file in state for reconnecting clients
+        with state_lock:
+            files = download_state['files']
+            file_entry = {'index': file_index, 'filename': filename, 'status': 'downloading', 'percent': 0, 'size': total_size}
+            found = False
+            for i, fe in enumerate(files):
+                if fe['index'] == file_index:
+                    files[i] = file_entry
+                    found = True
+                    break
+            if not found:
+                files.append(file_entry)
+
         emit_status('file_start', {
             'index': file_index,
             'filename': filename,
@@ -210,6 +233,11 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
                     now = time.time()
                     if now - last_emit_time >= 0.5:
                         percent = int((downloaded / total_size) * 100) if total_size > 0 else 0
+                        with state_lock:
+                            for fe in download_state['files']:
+                                if fe['index'] == file_index:
+                                    fe['percent'] = percent
+                                    break
                         emit_status('file_progress', {
                             'index': file_index,
                             'filename': filename,
@@ -217,6 +245,7 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
                             'total': total_size,
                             'percent': percent,
                         })
+                        emit_status('stats_update', download_state['stats'])
                         last_emit_time = now
         
         # Rename to final
@@ -342,8 +371,10 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
                         with state_lock:
                             download_state['stats']['completed_files'] += 1
                             
+                        update_file_state(idx, 'complete', 100)
                     elif result['auth_failed']:
                         add_log(f"✗ {filename}: {result['message']}", 'error')
+                        update_file_state(idx, 'failed')
                         auth_failed = True
                         # Cancel remaining futures
                         for f in futures:
@@ -352,16 +383,19 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
                         
                     elif 'not found' in result['message'].lower() or '404' in result['message']:
                         add_log(f"⊘ {filename}: not found", 'warning')
+                        update_file_state(idx, 'failed')
                         
                     else:
                         add_log(f"✗ {filename}: {result['message']}", 'error')
                         with state_lock:
                             download_state['stats']['failed_files'] += 1
                             
+                        update_file_state(idx, 'failed')
                 except Exception as e:
                     add_log(f"✗ {filename}: {e}", 'error')
                     with state_lock:
                         download_state['stats']['failed_files'] += 1
+                    update_file_state(idx, 'failed')
                 
                 emit_status('stats_update', download_state['stats'])
         
@@ -858,6 +892,7 @@ HTML_TEMPLATE = '''
             document.getElementById('stat-skipped').textContent = state.stats.skipped_files;
             document.getElementById('stat-size').textContent = formatBytes(state.stats.bytes_downloaded);
             lastBytesDownloaded = state.stats.bytes_downloaded;
+            lastSpeedUpdate = Date.now();
             
             // Update progress bar (include skipped in progress)
             const total = state.stats.total_files || 1;
@@ -868,8 +903,11 @@ HTML_TEMPLATE = '''
             // Restore file list
             const fileList = document.getElementById('file-list');
             fileList.innerHTML = '';
-            state.files.forEach((file, index) => {
-                updateFileStatus(index, file.filename, file.status);
+            state.files.forEach((file) => {
+                updateFileStatus(file.index, file.filename, file.status);
+                if (file.status === 'downloading' && file.percent > 0) {
+                    updateFileProgress(file.index, file.percent);
+                }
             });
             
             // Restore log
@@ -929,6 +967,7 @@ HTML_TEMPLATE = '''
         
         socket.on('stats_update', (stats) => {
             document.getElementById('stat-complete').textContent = stats.completed_files;
+            document.getElementById('stat-total').textContent = stats.total_files;
             document.getElementById('stat-failed').textContent = stats.failed_files;
             document.getElementById('stat-skipped').textContent = stats.skipped_files;
             document.getElementById('stat-size').textContent = formatBytes(stats.bytes_downloaded);
