@@ -69,6 +69,7 @@ download_state = {
     'parallel': DEFAULT_PARALLEL,
     'file_count': DEFAULT_FILE_COUNT,
     'files': [],
+    'saved_partials': None,
     'stats': {
         'total_files': 0,
         'completed_files': 0,
@@ -115,6 +116,22 @@ def update_file_state(file_index, status, percent=None):
                 if percent is not None:
                     fe['percent'] = percent
                 break
+
+
+def get_saved_partials(parts):
+    """List bytes still on disk for unfinished parts in the current export."""
+    saved = []
+    for index, _, path, filename in parts:
+        try:
+            size = get_temp_path(path).stat().st_size
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            add_log(f"Could not check saved bytes for {filename}: {error}", 'warning')
+            continue
+        if size > 0:
+            saved.append({'index': index, 'filename': filename, 'downloaded': size})
+    return saved
 
 def download_file(url: str, output_path: Path, file_index: int, cookie: str, size_history: SizeHistory, extension: str = ".zip") -> dict:
     """Download a single file with progress tracking and resume support."""
@@ -235,8 +252,9 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
             files = download_state['files']
             file_entry = {
                 'index': file_index, 'filename': filename, 'status': 'downloading',
-                'percent': resume_from * 100 // total_size if total_size else 0,
-                'size': total_size, 'resumed_from': resume_from,
+                'percent': resume_from * 100 / total_size if total_size else 0,
+                'total': total_size, 'resumed_from': resume_from,
+                'downloaded': resume_from, 'speed': 0,
             }
             found = False
             for i, fe in enumerate(files):
@@ -247,17 +265,13 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
             if not found:
                 files.append(file_entry)
 
-        emit_status('file_start', {
-            'index': file_index,
-            'filename': filename,
-            'size': total_size,
-            'resumed_from': resume_from,
-        })
+        emit_status('file_start', dict(file_entry))
         
         # Open file in append mode for resume, write mode for fresh
         file_mode = 'ab' if resume_from > 0 and response.status_code == 206 else 'wb'
         downloaded = resume_from
-        last_emit_time = time.time()
+        last_emit_time = time.monotonic()
+        last_emitted_bytes = resume_from
         
         with open(temp_path, file_mode) as f:
             for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
@@ -285,23 +299,20 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
                         download_state['stats']['bytes_downloaded'] += len(chunk)
                     
                     # Emit progress every 500ms
-                    now = time.time()
+                    now = time.monotonic()
                     if now - last_emit_time >= 0.5:
-                        percent = int((downloaded / total_size) * 100) if total_size > 0 else 0
-                        with state_lock:
-                            for fe in download_state['files']:
-                                if fe['index'] == file_index:
-                                    fe['percent'] = percent
-                                    break
-                        emit_status('file_progress', {
-                            'index': file_index,
-                            'filename': filename,
+                        progress = {
                             'downloaded': downloaded,
-                            'total': total_size,
-                            'percent': percent,
-                        })
+                            'percent': downloaded * 100 / total_size if total_size else 0,
+                            'speed': (downloaded - last_emitted_bytes) / (now - last_emit_time),
+                        }
+                        with state_lock:
+                            file_entry.update(progress)
+                            snapshot = dict(file_entry)
+                        emit_status('file_progress', snapshot)
                         emit_status('stats_update', download_state['stats'])
                         last_emit_time = now
+                        last_emitted_bytes = downloaded
         
         if total_size > 0 and downloaded != total_size:
             result['message'] = 'Downloaded size does not match the expected archive size'
@@ -342,7 +353,7 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from itertools import islice
 
-    stopped = False
+    saved_partials = None
     try:
         with state_lock:
             download_state['cookie'] = cookie
@@ -356,6 +367,7 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
                 'start_time': datetime.now().isoformat(),
             }
             download_state['files'] = []
+            download_state['saved_partials'] = None
             download_state['log'] = []
 
         add_log(f'Starting downloads (parallel: {parallel})...', 'info')
@@ -385,7 +397,7 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
 
         # Build list of files to download
         to_download = []
-        skipped = 0
+        skipped_files = []
         for num in range(1, file_count + 1):
             filename = f"{base_url.split('/')[-1]}{num:03d}{extension}"
             filepath = output_path / filename
@@ -394,31 +406,38 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
             if filepath.exists() and filepath.stat().st_size > 0:
                 expected = size_history.get_expected_size(filename)
                 if not expected or filepath.stat().st_size >= expected:
-                    skipped += 1
+                    skipped_files.append({'index': num, 'filename': filename, 'status': 'skipped'})
                     continue
 
             file_url = build_file_url(base_url, extension, query_string, num)
             to_download.append((num, file_url, filepath, filename))
 
         to_download.sort(key=lambda item: not get_temp_path(item[2]).is_file())
+        skipped = len(skipped_files)
 
         with state_lock:
+            download_state['files'].extend(skipped_files)
             download_state['stats']['skipped_files'] = skipped
             download_state['stats']['total_files'] = len(to_download) + skipped
             current_cookie = download_state['cookie']
 
+        emit_status('download_info', {
+            'total': len(to_download), 'skipped': skipped, 'skipped_files': skipped_files,
+        })
+        emit_status('stats_update', download_state['stats'])
+
         if not to_download:
+            if download_state['should_stop']:
+                saved_partials = []
+                return
             add_log('All files already downloaded!', 'success')
-            emit_status('stats_update', download_state['stats'])
             emit_status('download_complete', {
                 'message': 'All files already downloaded',
                 'stats': download_state['stats'],
             })
             return
 
-        add_log(f'Downloading {len(to_download)} files...', 'info')
-        emit_status('download_info', {'total': len(to_download), 'skipped': skipped})
-        emit_status('stats_update', download_state['stats'])
+        add_log(f'Checking up to {len(to_download)} remaining parts...', 'info')
 
         auth_failed = False
         # Keep only one task per worker in flight so Stop leaves later parts untouched.
@@ -481,11 +500,11 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
                     if part is not None:
                         submit(part)
 
-        stopped = download_state['should_stop']
         if auth_failed:
             add_log('⚠️ Authentication needed - provide new cURL', 'warning')
             emit_status('auth_required', {'message': 'Auth expired. Provide new cURL.'})
-        elif stopped:
+        elif download_state['should_stop']:
+            saved_partials = get_saved_partials(to_download)
             add_log('⏹ Download stopped', 'warning')
         else:
             stats = download_state['stats']
@@ -502,8 +521,9 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
     finally:
         with state_lock:
             download_state['is_running'] = False
-        if stopped and not auth_failed:
-            emit_status('download_stopped', {'message': 'Download stopped'})
+            download_state['saved_partials'] = saved_partials
+        if saved_partials is not None:
+            emit_status('download_stopped', {'message': 'Download stopped', 'saved_partials': saved_partials})
 
 # ============================================================================
 # WEB ROUTES
@@ -718,6 +738,20 @@ HTML_TEMPLATE = '''
             overflow-y: auto;
         }
 
+        #download-status {
+            margin: 16px 0 0;
+        }
+
+        .file-details {
+            flex-basis: 100%;
+            color: var(--text-dim);
+            font-size: 0.85rem;
+        }
+
+        .file-details:empty {
+            display: none;
+        }
+
         .active-files {
             margin-top: 20px;
         }
@@ -761,12 +795,13 @@ HTML_TEMPLATE = '''
             font-weight: 600;
         }
         
-        .file-status.pending { background: var(--bg-light); color: var(--text-dim); }
+        .file-status.pending,
+        .file-status.skipped,
+        .file-status.stopped { background: var(--bg-light); color: var(--text-dim); }
         .file-status.downloading { background: var(--accent); color: white; }
         .file-status.complete { background: var(--success); color: white; }
         .file-status.failed { background: var(--error); color: white; }
         .file-status.not_found { background: var(--bg-light); color: var(--warning); }
-        .file-status.stopped { background: var(--bg-light); color: var(--text-dim); }
         
         .progress-bar {
             width: 100%;
@@ -850,7 +885,7 @@ HTML_TEMPLATE = '''
                     <input type="number" id="parallel" value="{{ parallel }}" min="1" max="20">
                 </div>
                 <div class="form-group">
-                    <label for="file-count">Parts</label>
+                    <label for="file-count">Max parts to check</label>
                     <input type="number" id="file-count" value="{{ file_count }}" min="1" max="500">
                 </div>
             </div>
@@ -869,12 +904,12 @@ HTML_TEMPLATE = '''
             
             <div class="stats-grid">
                 <div class="stat-box">
-                    <div class="stat-value" id="stat-total">0</div>
-                    <div class="stat-label">Total Files</div>
+                    <div class="stat-value" id="stat-checked">0 / 0</div>
+                    <div class="stat-label">Parts checked</div>
                 </div>
                 <div class="stat-box success">
                     <div class="stat-value" id="stat-complete">0</div>
-                    <div class="stat-label">Completed</div>
+                    <div class="stat-label">Archives downloaded</div>
                 </div>
                 <div class="stat-box error">
                     <div class="stat-value" id="stat-failed">0</div>
@@ -902,6 +937,8 @@ HTML_TEMPLATE = '''
                 <div class="progress-fill" id="overall-progress" style="width: 0%"></div>
             </div>
 
+            <p id="download-status" role="status" hidden></p>
+
             <section class="active-files" aria-labelledby="active-files-heading">
                 <h3 id="active-files-heading">Downloading now</h3>
                 <p id="active-files-empty">No active downloads</p>
@@ -926,7 +963,6 @@ HTML_TEMPLATE = '''
     
     <script>
         const socket = io();
-        let downloadStartTime = null;
         let lastBytesDownloaded = 0;
         let lastSpeedUpdate = Date.now();
         
@@ -951,7 +987,7 @@ HTML_TEMPLATE = '''
         }
         
         function formatBytes(bytes) {
-            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024) return Math.round(bytes) + ' B';
             if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
             if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
             return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
@@ -974,7 +1010,6 @@ HTML_TEMPLATE = '''
             document.getElementById('progress-card').classList.remove('hidden');
             document.getElementById('files-card').classList.remove('hidden');
             
-            downloadStartTime = Date.now();
             lastBytesDownloaded = 0;
             
             log('Starting download...', 'info');
@@ -1007,16 +1042,19 @@ HTML_TEMPLATE = '''
 
         function stopDownload() {
             document.getElementById('stop-btn').disabled = true;
-            log('Stopping download...', 'warning');
+            setDownloadStatus('Stopping… Waiting for active downloads to stop.');
             fetch('/api/stop', { method: 'POST' })
                 .then(res => res.json())
                 .then(data => {
                     if (data.error) {
                         showAlert(data.error);
-                        document.getElementById('stop-btn').disabled = false;
+                        socket.emit('request_state');
                     }
                 })
-                .catch(err => showAlert('Failed to stop download: ' + err));
+                .catch(err => {
+                    showAlert('Failed to stop download: ' + err);
+                    socket.emit('request_state');
+                });
         }
         
         // Socket event handlers
@@ -1031,25 +1069,11 @@ HTML_TEMPLATE = '''
                 document.getElementById('files-card').classList.remove('hidden');
                 document.getElementById('start-btn').disabled = state.is_running;
             }
-            document.getElementById('stop-btn').disabled = !state.is_running;
-            
-            // Restore stats
-            document.getElementById('stat-total').textContent = state.stats.total_files;
-            document.getElementById('stat-complete').textContent = state.stats.completed_files;
-            document.getElementById('stat-failed').textContent = state.stats.failed_files;
-            document.getElementById('stat-skipped').textContent = state.stats.skipped_files;
-            document.getElementById('stat-not-found').textContent = state.stats.not_found_files || 0;
-            document.getElementById('stat-size').textContent = formatBytes(state.stats.bytes_downloaded);
+            document.getElementById('stop-btn').disabled = !state.is_running || state.is_stopping;
+            renderStats(state.stats);
             lastBytesDownloaded = state.stats.bytes_downloaded;
             lastSpeedUpdate = Date.now();
-            
-            // Update progress bar (every processed file counts)
-            const total = state.stats.total_files || 1;
-            const completed = state.stats.completed_files + state.stats.failed_files
-                + state.stats.skipped_files + (state.stats.not_found_files || 0);
-            const percent = Math.min((completed / total) * 100, 100);
-            document.getElementById('overall-progress').style.width = percent + '%';
-            
+
             // Restore file list
             clearFileLists();
             state.files.forEach((file) => {
@@ -1057,10 +1081,18 @@ HTML_TEMPLATE = '''
                     ? 'interrupted' : file.status;
                 updateFileStatus(file.index, file.filename, status);
                 if (status === 'downloading') {
-                    updateFileProgress(file.index, file.percent, file.resumed_from);
+                    updateFileProgress(file);
                 }
             });
             
+            if (state.is_stopping) {
+                setDownloadStatus('Stopping… Waiting for active downloads to stop.');
+            } else if (state.saved_partials !== null) {
+                renderSavedPartials(state.saved_partials);
+            } else {
+                setDownloadStatus('');
+            }
+
             // Restore log
             const logContainer = document.getElementById('log-container');
             logContainer.innerHTML = '';
@@ -1088,7 +1120,12 @@ HTML_TEMPLATE = '''
         });
         
         socket.on('download_started', (data) => {
+            document.getElementById('progress-card').classList.remove('hidden');
+            document.getElementById('files-card').classList.remove('hidden');
+            document.getElementById('start-btn').disabled = true;
+            document.getElementById('stop-btn').disabled = false;
             clearFileLists();
+            setDownloadStatus('');
             document.getElementById('stat-speed').textContent = '0 B/s';
             lastBytesDownloaded = 0;
             lastSpeedUpdate = Date.now();
@@ -1096,24 +1133,24 @@ HTML_TEMPLATE = '''
         });
         
         socket.on('download_info', (data) => {
-            document.getElementById('stat-total').textContent = data.total + data.skipped;
-            document.getElementById('stat-skipped').textContent = data.skipped;
-            log(`Found ${data.total} files to download (${data.skipped} skipped)`, 'info');
+            for (const file of data.skipped_files) {
+                updateFileStatus(file.index, file.filename, file.status);
+            }
+            if (data.total) {
+                log(`Checking up to ${data.total} parts (${data.skipped} already downloaded)`, 'info');
+            }
         });
         
         socket.on('file_start', (data) => {
             if (!data.resumed_from) {
-                log(`Starting: ${data.filename} (${formatBytes(data.size)})`, 'info');
+                log(`Starting: ${data.filename} (${formatBytes(data.total)})`, 'info');
             }
             updateFileStatus(data.index, data.filename, 'downloading');
-            const percent = data.size ? Math.floor(data.resumed_from * 100 / data.size) : 0;
-            updateFileProgress(data.index, percent, data.resumed_from);
+            updateFileProgress(data);
         });
-        
-        socket.on('file_progress', (data) => {
-            updateFileProgress(data.index, data.percent);
-        });
-        
+
+        socket.on('file_progress', updateFileProgress);
+
         socket.on('file_complete', (data) => {
             // The server already logs the outcome; only update the row here.
             if (data.success) {
@@ -1127,14 +1164,22 @@ HTML_TEMPLATE = '''
             }
         });
         
-        socket.on('stats_update', (stats) => {
+        function renderStats(stats) {
             document.getElementById('stat-complete').textContent = stats.completed_files;
-            document.getElementById('stat-total').textContent = stats.total_files;
             document.getElementById('stat-failed').textContent = stats.failed_files;
             document.getElementById('stat-skipped').textContent = stats.skipped_files;
             document.getElementById('stat-not-found').textContent = stats.not_found_files || 0;
             document.getElementById('stat-size').textContent = formatBytes(stats.bytes_downloaded);
             
+            const checked = stats.completed_files + stats.failed_files + stats.skipped_files
+                + stats.not_found_files;
+            document.getElementById('stat-checked').textContent = `${checked} / ${stats.total_files}`;
+            const percent = stats.total_files ? checked / stats.total_files * 100 : 0;
+            document.getElementById('overall-progress').style.width = percent + '%';
+        }
+
+        socket.on('stats_update', (stats) => {
+            renderStats(stats);
             // Calculate speed - update every 0.5 seconds for faster feedback
             const now = Date.now();
             const elapsed = (now - lastSpeedUpdate) / 1000;
@@ -1148,16 +1193,18 @@ HTML_TEMPLATE = '''
                 lastSpeedUpdate = now;
             }
             
-            // Update progress bar
-            const total = parseInt(document.getElementById('stat-total').textContent) || 1;
-            const completed = stats.completed_files + stats.failed_files + stats.skipped_files
-                + (stats.not_found_files || 0);
-            const percent = Math.min((completed / total) * 100, 100);
-            document.getElementById('overall-progress').style.width = percent + '%';
         });
-        
+
+        socket.on('download_stopping', () => {
+            document.getElementById('start-btn').disabled = true;
+            document.getElementById('stop-btn').disabled = true;
+            setDownloadStatus('Stopping… Waiting for active downloads to stop.');
+        });
+
         socket.on('auth_required', (data) => {
+            setDownloadStatus('');
             finishActiveRows('interrupted');
+            document.getElementById('stat-speed').textContent = '0 B/s';
             log('⚠️ ' + data.message, 'warning');
             showAlert(data.message + ' Please update the cookie and restart.', 'error');
             document.getElementById('start-btn').disabled = false;
@@ -1166,6 +1213,8 @@ HTML_TEMPLATE = '''
 
         socket.on('download_stopped', (data) => {
             finishActiveRows('stopped');
+            renderSavedPartials(data.saved_partials);
+            document.getElementById('stat-speed').textContent = '0 B/s';
             log('⏹ ' + data.message, 'warning');
             showAlert(data.message, 'success');
             document.getElementById('start-btn').disabled = false;
@@ -1173,7 +1222,9 @@ HTML_TEMPLATE = '''
         });
         
         socket.on('download_complete', (data) => {
+            setDownloadStatus('');
             finishActiveRows('interrupted');
+            document.getElementById('stat-speed').textContent = '0 B/s';
             log('🎉 ' + data.message, 'success');
             showAlert(data.message, 'success');
             document.getElementById('start-btn').disabled = false;
@@ -1181,13 +1232,34 @@ HTML_TEMPLATE = '''
         });
         
         socket.on('error', (data) => {
+            setDownloadStatus('');
             finishActiveRows('interrupted');
+            document.getElementById('stat-speed').textContent = '0 B/s';
             log('Error: ' + data.message, 'error');
             showAlert(data.message);
             document.getElementById('start-btn').disabled = false;
             document.getElementById('stop-btn').disabled = true;
         });
         
+        function setDownloadStatus(message) {
+            const status = document.getElementById('download-status');
+            status.textContent = message;
+            status.hidden = !message;
+        }
+
+        function renderSavedPartials(parts) {
+            const count = parts.length;
+            setDownloadStatus(count
+                ? `${count} partial ${count === 1 ? 'archive' : 'archives'} saved. Start Download will try to resume ${count === 1 ? 'it' : 'them'}.`
+                : 'Download stopped. No partial archives were saved.');
+            for (const part of [...parts].reverse()) {
+                updateFileStatus(part.index, part.filename, 'stopped');
+                const row = document.getElementById(`file-${part.index}`);
+                row.querySelector('.file-details').textContent = `${formatBytes(part.downloaded)} saved`;
+                document.getElementById('file-list').prepend(row);
+            }
+        }
+
         function clearFileLists() {
             document.getElementById('active-files').replaceChildren();
             document.getElementById('file-list').replaceChildren();
@@ -1221,28 +1293,29 @@ HTML_TEMPLATE = '''
 
                 item.appendChild(nameEl);
                 item.appendChild(statusEl);
+
+                const details = document.createElement('span');
+                details.className = 'file-details';
+                item.appendChild(details);
             }
             const statusEl = item.querySelector('.file-status');
             statusEl.className = `file-status ${status}`;
             statusEl.textContent = status === 'not_found'
-                ? 'Not found' : status[0].toUpperCase() + status.slice(1);
+                ? 'Not found' : status === 'skipped' ? 'SKIPPED' : status[0].toUpperCase() + status.slice(1);
+            item.querySelector('.file-details').textContent = '';
             if (item.parentElement !== list) list.appendChild(item);
             document.getElementById('active-files-empty').hidden = active.childElementCount > 0;
         }
         
-        function updateFileProgress(index, percent, resumedFrom) {
-            const item = document.getElementById(`file-${index}`);
-            if (item) {
-                const statusEl = item.querySelector('.file-status');
-                if (!statusEl.classList.contains('downloading')) return;
-                if (resumedFrom !== undefined) {
-                    statusEl.dataset.resumedFrom = resumedFrom;
-                }
-                const offset = Number(statusEl.dataset.resumedFrom || 0);
-                statusEl.textContent = offset
-                    ? `Resuming from ${formatBytes(offset)} · ${percent}%`
-                    : `New download · ${percent}%`;
-            }
+        function updateFileProgress(part) {
+            const item = document.getElementById(`file-${part.index}`);
+            const status = item?.querySelector('.file-status');
+            if (!status?.classList.contains('downloading')) return;
+
+            status.textContent = `${part.percent.toFixed(1)}%`;
+            const transfer = `${formatBytes(part.downloaded)} / ${formatBytes(part.total)} · ${formatBytes(part.speed)}/s`;
+            const origin = part.resumed_from ? `Resumed from ${formatBytes(part.resumed_from)}` : 'New download';
+            item.querySelector('.file-details').textContent = `${transfer} · ${origin}`;
         }
         
         // Fetch state on page load (backup in case socket is slow)
@@ -1323,6 +1396,7 @@ def api_stop():
         if not download_state['is_running']:
             return jsonify({'error': 'No download in progress'}), 409
         download_state['should_stop'] = True
+        emit_status('download_stopping', {})
     add_log('⏹ Stop requested - finishing current chunks...', 'warning')
     return jsonify({'status': 'stopping'})
 
@@ -1332,6 +1406,8 @@ def api_status():
     with state_lock:
         return jsonify({
             'is_running': download_state['is_running'],
+            'is_stopping': download_state['is_running'] and download_state['should_stop'],
+            'saved_partials': download_state['saved_partials'],
             'stats': download_state['stats'],
             'files': download_state['files'],
             'log': download_state['log'],
@@ -1345,6 +1421,8 @@ def handle_connect():
             # Send current state to the reconnecting client
             emit('restore_state', {
                 'is_running': download_state['is_running'],
+                'is_stopping': download_state['is_running'] and download_state['should_stop'],
+                'saved_partials': download_state['saved_partials'],
                 'stats': download_state['stats'],
                 'files': download_state['files'],
                 'log': download_state['log'],
@@ -1356,6 +1434,8 @@ def handle_request_state():
     with state_lock:
         emit('restore_state', {
             'is_running': download_state['is_running'],
+            'is_stopping': download_state['is_running'] and download_state['should_stop'],
+            'saved_partials': download_state['saved_partials'],
             'stats': download_state['stats'],
             'files': download_state['files'],
             'log': download_state['log'],

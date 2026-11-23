@@ -381,6 +381,7 @@ def _reset_web_state():
         web.download_state['is_running'] = False
         web.download_state['should_stop'] = False
         web.download_state['files'] = []
+        web.download_state['saved_partials'] = None
         web.download_state['log'] = []
         web.download_state['stats'] = {
             'total_files': 0,
@@ -425,6 +426,32 @@ def test_web_run_downloads_finishes_and_does_not_deadlock(tmp_path, archive_serv
     assert stats['total_files'] == 3
     assert (tmp_path / 'takeout-20251207T071725Z-3-001.zip').exists()
     assert (tmp_path / 'takeout-20251207T071725Z-3-002.zip').exists()
+
+
+def test_web_lists_skipped_archives_when_all_parts_exist(tmp_path, monkeypatch):
+    import google_takeout_web as web
+
+    _reset_web_state()
+    files = [
+        {'index': index, 'filename': f'{PART_PREFIX[1:]}{index:03d}.zip', 'status': 'skipped'}
+        for index in (1, 2)
+    ]
+    for file in files:
+        (tmp_path / file['filename']).write_bytes(SAMPLE_ZIP)
+    emit = Mock()
+    get = Mock()
+    monkeypatch.setattr(web.socketio, 'emit', emit)
+    monkeypatch.setattr(requests, 'get', get)
+
+    url = f'https://takeout.google.com{PART_PREFIX}001.zip'
+    web.run_downloads('SID=test', url, str(tmp_path), 2, 2)
+
+    get.assert_not_called()
+    emit.assert_any_call('download_info', {'total': 0, 'skipped': 2, 'skipped_files': files})
+    state = web.app.test_client().get('/api/status').json
+    assert state['files'] == files
+    assert state['stats']['skipped_files'] == 2
+    assert state['stats']['completed_files'] == 0
 
 
 def test_web_download_file_stops_and_keeps_partial(tmp_path, slow_archive_server, monkeypatch):
@@ -477,15 +504,23 @@ def test_web_stop_and_restart_resumes_both_parts(tmp_path, monkeypatch):
     both_started = threading.Barrier(3)
     release_workers = threading.Event()
     stopped = threading.Event()
+    stopping = threading.Event()
     finished = threading.Event()
     requests_seen = []
     starts = {}
+    progress = {}
+    saved = []
     split = len(SAMPLE_ZIP) // 2
 
     def emit(event, data):
         if event == 'file_start':
-            starts[data['index']] = data['resumed_from']
+            starts[data['index']] = data
+        elif event == 'file_progress':
+            progress[data['index']] = data
+        elif event == 'download_stopping':
+            stopping.set()
         elif event == 'download_stopped':
+            saved.extend(data['saved_partials'])
             stopped.set()
         elif event == 'download_complete':
             finished.set()
@@ -516,6 +551,7 @@ def test_web_stop_and_restart_resumes_both_parts(tmp_path, monkeypatch):
 
     monkeypatch.setattr(web.socketio, 'emit', emit)
     monkeypatch.setattr(requests, 'get', get)
+    monkeypatch.setattr(web, 'time', Mock(monotonic=Mock(side_effect=range(100))))
     url = f'https://takeout.google.com{PART_PREFIX}001.zip'
     payload = {
         'curl_input': f"curl '{url}' -b 'SID=test'",
@@ -527,17 +563,29 @@ def test_web_stop_and_restart_resumes_both_parts(tmp_path, monkeypatch):
     try:
         both_started.wait(timeout=5)
         assert client.post('/api/stop').json == {'status': 'stopping'}
+        assert stopping.is_set()
+        assert client.get('/api/status').json['is_stopping']
+        assert set(progress) == {1, 2}
+        assert all(part['downloaded'] == split and part['speed'] > 0 for part in progress.values())
     finally:
         release_workers.set()
     assert stopped.wait(timeout=5)
     assert sorted(requests_seen) == [(1, None), (2, None)]
-    assert {entry['status'] for entry in client.get('/api/status').json['files']} == {'stopped'}
+    state = client.get('/api/status').json
+    assert not state['is_stopping']
+    assert {entry['status'] for entry in state['files']} == {'stopped'}
+    assert state['saved_partials'] == saved == [
+        {'index': part, 'filename': f'{PART_PREFIX[1:]}{part:03d}.zip', 'downloaded': split}
+        for part in (1, 2)
+    ]
 
     requests_seen.clear()
     starts.clear()
     assert client.post('/api/start', json=payload).json == {'status': 'started'}
     assert finished.wait(timeout=5)
     assert sorted(requests_seen) == [(1, f'bytes={split}-'), (2, f'bytes={split}-'), (3, None)]
-    assert starts == {1: split, 2: split, 3: 0}
+    assert {index: part['resumed_from'] for index, part in starts.items()} == {1: split, 2: split, 3: 0}
+    assert all(part['downloaded'] == part['resumed_from'] and part['speed'] == 0 for part in starts.values())
+    assert all(part['total'] == len(SAMPLE_ZIP) for part in starts.values())
     for part in range(1, 4):
         assert (tmp_path / f'{PART_PREFIX[1:]}{part:03d}.zip').read_bytes() == SAMPLE_ZIP
