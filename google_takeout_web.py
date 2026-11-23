@@ -354,6 +354,7 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
     from itertools import islice
 
     saved_partials = None
+    terminal_event = None
     try:
         with state_lock:
             download_state['cookie'] = cookie
@@ -371,14 +372,17 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
             download_state['log'] = []
 
         add_log(f'Starting downloads (parallel: {parallel})...', 'info')
-        emit_status('download_started', {'message': 'Starting downloads...'})
+        with state_lock:
+            emit_status('download_started', {
+                'message': 'Starting downloads...', 'is_stopping': download_state['should_stop'],
+            })
 
         # Parse URL
         base_url, file_num, extension, query_string = extract_url_parts(url)
 
         if base_url is None:
             add_log('Invalid URL format', 'error')
-            emit_status('error', {'message': 'Invalid URL format'})
+            terminal_event = ('error', {'message': 'Invalid URL format'})
             return
 
         output_path = Path(output_dir)
@@ -387,7 +391,7 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
         except OSError as e:
             message = f'Cannot create output directory {output_dir!r}: {e}'
             add_log(message, 'error')
-            emit_status('error', {'message': message})
+            terminal_event = ('error', {'message': message})
             return
 
         size_history = SizeHistory(output_dir)
@@ -431,7 +435,7 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
                 saved_partials = []
                 return
             add_log('All files already downloaded!', 'success')
-            emit_status('download_complete', {
+            terminal_event = ('download_complete', {
                 'message': 'All files already downloaded',
                 'stats': download_state['stats'],
             })
@@ -502,7 +506,7 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
 
         if auth_failed:
             add_log('⚠️ Authentication needed - provide new cURL', 'warning')
-            emit_status('auth_required', {'message': 'Auth expired. Provide new cURL.'})
+            terminal_event = ('auth_required', {'message': 'Auth expired. Provide new cURL.'})
         elif download_state['should_stop']:
             saved_partials = get_saved_partials(to_download)
             add_log('⏹ Download stopped', 'warning')
@@ -513,17 +517,19 @@ def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_co
                 f"{stats['not_found_files']} missing, {stats['failed_files']} failed",
                 'success',
             )
-            emit_status('download_complete', {'message': 'Done!', 'stats': stats})
+            terminal_event = ('download_complete', {'message': 'Done!', 'stats': stats})
     except Exception as e:
         # Never leave the UI stuck in "running" if something unexpected blows up.
         add_log(f'Unexpected error: {e}', 'error')
-        emit_status('error', {'message': f'Unexpected error: {e}'})
+        terminal_event = ('error', {'message': f'Unexpected error: {e}'})
     finally:
         with state_lock:
             download_state['is_running'] = False
             download_state['saved_partials'] = saved_partials
-        if saved_partials is not None:
-            emit_status('download_stopped', {'message': 'Download stopped', 'saved_partials': saved_partials})
+            if saved_partials is not None:
+                emit_status('download_stopped', {'message': 'Download stopped', 'saved_partials': saved_partials})
+            elif terminal_event is not None:
+                emit_status(*terminal_event)
 
 # ============================================================================
 # WEB ROUTES
@@ -666,49 +672,53 @@ HTML_TEMPLATE = '''
             transform: translateY(-1px);
         }
         
-        .btn-primary:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-        
         .btn-danger {
             background: var(--error);
             color: white;
         }
         
-        .btn-danger:hover {
+        .btn-danger:hover:not(:disabled) {
             background: #dc2626;
         }
-        
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 16px;
+
+        button:disabled {
+            background: var(--bg-light);
+            color: var(--text-dim);
+            cursor: not-allowed;
         }
         
-        .stat-box {
-            background: var(--bg-dark);
-            padding: 16px;
-            border-radius: 8px;
-            text-align: center;
+        .progress-summary,
+        .progress-counts {
+            display: flex;
+            align-items: baseline;
+            flex-wrap: wrap;
+            gap: 8px 16px;
+            font-variant-numeric: tabular-nums;
         }
-        
-        .stat-value {
-            font-size: 1.8rem;
-            font-weight: 700;
-            color: var(--accent);
+
+        .progress-summary {
+            justify-content: space-between;
+            font-size: 0.95rem;
         }
-        
-        .stat-label {
+
+        .summary-total,
+        .progress-counts {
             color: var(--text-dim);
             font-size: 0.85rem;
-            margin-top: 4px;
         }
-        
-        .stat-box.success .stat-value { color: var(--success); }
-        .stat-box.error .stat-value { color: var(--error); }
-        .stat-box.warning .stat-value { color: var(--warning); }
-        
+
+        #stat-speed {
+            font-size: 1.1rem;
+            white-space: nowrap;
+        }
+
+        .progress-counts {
+            margin-top: 10px;
+        }
+
+        .progress-counts strong { color: var(--text); }
+        #stat-failed { color: var(--error); }
+
         .log-container {
             background: var(--bg-dark);
             border-radius: 8px;
@@ -779,7 +789,51 @@ HTML_TEMPLATE = '''
         }
 
         #active-files .file-item {
-            border-inline-start: 4px solid var(--accent);
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            padding: 12px 14px;
+            border-inline-start: 3px solid var(--accent-hover);
+            font-variant-numeric: tabular-nums;
+        }
+
+        #active-files .file-name {
+            grid-row: 3;
+            grid-column: 1 / -1;
+            color: var(--text-dim);
+            font-size: 0.75rem;
+        }
+
+        #active-files .file-status {
+            grid-row: 1;
+            grid-column: 2;
+            justify-self: end;
+        }
+
+        .part-metrics {
+            grid-row: 1;
+            grid-column: 1;
+            display: grid;
+            grid-template-columns: 5em minmax(9.5em, 1fr) 7em;
+            align-items: baseline;
+            gap: 4px 14px;
+            min-width: 0;
+            font-size: 0.85rem;
+        }
+
+        .part-label { color: var(--text); }
+        .part-bytes { color: var(--text-dim); }
+        .part-speed { white-space: nowrap; }
+
+        #active-files .transfer-progress {
+            grid-row: 2;
+            grid-column: 1 / -1;
+            height: 4px;
+            margin-top: 0;
+        }
+
+        #active-files .file-details {
+            grid-row: 4;
+            grid-column: 1 / -1;
         }
         
         .file-name {
@@ -803,21 +857,23 @@ HTML_TEMPLATE = '''
         .file-status.failed { background: var(--error); color: white; }
         .file-status.not_found { background: var(--bg-light); color: var(--warning); }
         
-        .progress-bar {
+        .transfer-progress {
+            display: block;
             width: 100%;
-            height: 8px;
-            background: var(--bg-dark);
-            border-radius: 4px;
-            overflow: hidden;
+            height: 6px;
             margin-top: 8px;
+            appearance: none;
+            border: 0;
+            border-radius: 999px;
+            overflow: hidden;
+            background: var(--bg-light);
+            color: var(--accent-hover);
         }
-        
-        .progress-fill {
-            height: 100%;
-            background: linear-gradient(90deg, var(--accent), #a855f7);
-            transition: width 0.3s ease;
-        }
-        
+
+        .transfer-progress::-webkit-progress-bar { background: var(--bg-light); }
+        .transfer-progress::-webkit-progress-value { background: var(--accent-hover); }
+        .transfer-progress::-moz-progress-bar { background: var(--accent-hover); }
+
         .hidden { display: none; }
         
         .alert {
@@ -845,6 +901,10 @@ HTML_TEMPLATE = '''
         }
         
         @media (max-width: 600px) {
+            .part-metrics {
+                display: flex;
+                flex-wrap: wrap;
+            }
             body { padding: 12px; }
             h1 { font-size: 1.5rem; }
             .card { padding: 16px; }
@@ -902,39 +962,19 @@ HTML_TEMPLATE = '''
         <div class="card hidden" id="progress-card">
             <h2>📊 Download Progress</h2>
             
-            <div class="stats-grid">
-                <div class="stat-box">
-                    <div class="stat-value" id="stat-checked">0 / 0</div>
-                    <div class="stat-label">Parts checked</div>
-                </div>
-                <div class="stat-box success">
-                    <div class="stat-value" id="stat-complete">0</div>
-                    <div class="stat-label">Archives downloaded</div>
-                </div>
-                <div class="stat-box error">
-                    <div class="stat-value" id="stat-failed">0</div>
-                    <div class="stat-label">Failed</div>
-                </div>
-                <div class="stat-box warning">
-                    <div class="stat-value" id="stat-skipped">0</div>
-                    <div class="stat-label">Skipped</div>
-                </div>
-                <div class="stat-box warning">
-                    <div class="stat-value" id="stat-not-found">0</div>
-                    <div class="stat-label">Not Found</div>
-                </div>
-                <div class="stat-box">
-                    <div class="stat-value" id="stat-size">0 GB</div>
-                    <div class="stat-label">Downloaded</div>
-                </div>
-                <div class="stat-box">
-                    <div class="stat-value" id="stat-speed">0 MB/s</div>
-                    <div class="stat-label">Speed</div>
-                </div>
+            <div class="progress-summary">
+                <p><strong id="stat-complete">0 archives downloaded</strong>
+                    <span class="summary-total">· <span id="stat-checked">0 of 0 parts checked</span></span>
+                </p>
+                <strong id="stat-speed" aria-label="Total download speed">0 B/s</strong>
             </div>
-            
-            <div class="progress-bar" style="margin-top: 20px;">
-                <div class="progress-fill" id="overall-progress" style="width: 0%"></div>
+            <progress id="overall-progress" class="transfer-progress" max="100" value="0"
+                aria-label="Parts checked"></progress>
+            <div class="progress-counts">
+                <span><strong id="stat-size">0 B</strong> downloaded</span>
+                <span><strong id="stat-failed">0</strong> failed</span>
+                <span><strong id="stat-skipped">0</strong> skipped</span>
+                <span><strong id="stat-not-found">0</strong> not found</span>
             </div>
 
             <p id="download-status" role="status" hidden></p>
@@ -961,6 +1001,15 @@ HTML_TEMPLATE = '''
         </div>
     </div>
     
+    <template id="part-progress-template">
+        <div class="part-metrics">
+            <strong class="part-label"></strong>
+            <span class="part-bytes"></span>
+            <span class="part-speed"></span>
+        </div>
+        <progress class="transfer-progress" max="100" value="0"></progress>
+    </template>
+
     <script>
         const socket = io();
         let lastBytesDownloaded = 0;
@@ -992,8 +1041,15 @@ HTML_TEMPLATE = '''
             if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
             return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
         }
+
+        function setDownloadControls(state) {
+            document.getElementById('start-btn').disabled = true;
+            document.getElementById('stop-btn').disabled = state !== 'running';
+            if (state === 'idle') document.getElementById('start-btn').disabled = false;
+        }
         
         function startDownload() {
+            if (document.getElementById('start-btn').disabled) return;
             const curlInput = document.getElementById('curl-input').value.trim();
             const urlInput = document.getElementById('url-input').value.trim();
             const outputDir = document.getElementById('output-dir').value.trim();
@@ -1005,8 +1061,7 @@ HTML_TEMPLATE = '''
                 return;
             }
             
-            document.getElementById('start-btn').disabled = true;
-            document.getElementById('stop-btn').disabled = false;
+            setDownloadControls('starting');
             document.getElementById('progress-card').classList.remove('hidden');
             document.getElementById('files-card').classList.remove('hidden');
             
@@ -1029,19 +1084,18 @@ HTML_TEMPLATE = '''
             .then(data => {
                 if (data.error) {
                     showAlert(data.error);
-                    document.getElementById('start-btn').disabled = false;
-                    document.getElementById('stop-btn').disabled = true;
+                    socket.emit('request_state');
                 }
             })
             .catch(err => {
                 showAlert('Failed to start download: ' + err);
-                document.getElementById('start-btn').disabled = false;
-                document.getElementById('stop-btn').disabled = true;
+                socket.emit('request_state');
             });
         }
 
         function stopDownload() {
-            document.getElementById('stop-btn').disabled = true;
+            if (document.getElementById('stop-btn').disabled) return;
+            setDownloadControls('stopping');
             setDownloadStatus('Stopping… Waiting for active downloads to stop.');
             fetch('/api/stop', { method: 'POST' })
                 .then(res => res.json())
@@ -1067,9 +1121,8 @@ HTML_TEMPLATE = '''
             if (state.is_running || state.stats.total_files > 0) {
                 document.getElementById('progress-card').classList.remove('hidden');
                 document.getElementById('files-card').classList.remove('hidden');
-                document.getElementById('start-btn').disabled = state.is_running;
             }
-            document.getElementById('stop-btn').disabled = !state.is_running || state.is_stopping;
+            setDownloadControls(state.is_stopping ? 'stopping' : state.is_running ? 'running' : 'idle');
             renderStats(state.stats);
             lastBytesDownloaded = state.stats.bytes_downloaded;
             lastSpeedUpdate = Date.now();
@@ -1122,10 +1175,9 @@ HTML_TEMPLATE = '''
         socket.on('download_started', (data) => {
             document.getElementById('progress-card').classList.remove('hidden');
             document.getElementById('files-card').classList.remove('hidden');
-            document.getElementById('start-btn').disabled = true;
-            document.getElementById('stop-btn').disabled = false;
+            setDownloadControls(data.is_stopping ? 'stopping' : 'running');
             clearFileLists();
-            setDownloadStatus('');
+            setDownloadStatus(data.is_stopping ? 'Stopping… Waiting for active downloads to stop.' : '');
             document.getElementById('stat-speed').textContent = '0 B/s';
             lastBytesDownloaded = 0;
             lastSpeedUpdate = Date.now();
@@ -1165,7 +1217,9 @@ HTML_TEMPLATE = '''
         });
         
         function renderStats(stats) {
-            document.getElementById('stat-complete').textContent = stats.completed_files;
+            const complete = stats.completed_files;
+            document.getElementById('stat-complete').textContent =
+                `${complete} ${complete === 1 ? 'archive' : 'archives'} downloaded`;
             document.getElementById('stat-failed').textContent = stats.failed_files;
             document.getElementById('stat-skipped').textContent = stats.skipped_files;
             document.getElementById('stat-not-found').textContent = stats.not_found_files || 0;
@@ -1173,9 +1227,9 @@ HTML_TEMPLATE = '''
             
             const checked = stats.completed_files + stats.failed_files + stats.skipped_files
                 + stats.not_found_files;
-            document.getElementById('stat-checked').textContent = `${checked} / ${stats.total_files}`;
+            document.getElementById('stat-checked').textContent = `${checked} of ${stats.total_files} parts checked`;
             const percent = stats.total_files ? checked / stats.total_files * 100 : 0;
-            document.getElementById('overall-progress').style.width = percent + '%';
+            document.getElementById('overall-progress').value = percent;
         }
 
         socket.on('stats_update', (stats) => {
@@ -1196,8 +1250,7 @@ HTML_TEMPLATE = '''
         });
 
         socket.on('download_stopping', () => {
-            document.getElementById('start-btn').disabled = true;
-            document.getElementById('stop-btn').disabled = true;
+            setDownloadControls('stopping');
             setDownloadStatus('Stopping… Waiting for active downloads to stop.');
         });
 
@@ -1207,8 +1260,7 @@ HTML_TEMPLATE = '''
             document.getElementById('stat-speed').textContent = '0 B/s';
             log('⚠️ ' + data.message, 'warning');
             showAlert(data.message + ' Please update the cookie and restart.', 'error');
-            document.getElementById('start-btn').disabled = false;
-            document.getElementById('stop-btn').disabled = true;
+            setDownloadControls('idle');
         });
 
         socket.on('download_stopped', (data) => {
@@ -1217,8 +1269,7 @@ HTML_TEMPLATE = '''
             document.getElementById('stat-speed').textContent = '0 B/s';
             log('⏹ ' + data.message, 'warning');
             showAlert(data.message, 'success');
-            document.getElementById('start-btn').disabled = false;
-            document.getElementById('stop-btn').disabled = true;
+            setDownloadControls('idle');
         });
         
         socket.on('download_complete', (data) => {
@@ -1227,8 +1278,7 @@ HTML_TEMPLATE = '''
             document.getElementById('stat-speed').textContent = '0 B/s';
             log('🎉 ' + data.message, 'success');
             showAlert(data.message, 'success');
-            document.getElementById('start-btn').disabled = false;
-            document.getElementById('stop-btn').disabled = true;
+            setDownloadControls('idle');
         });
         
         socket.on('error', (data) => {
@@ -1237,8 +1287,7 @@ HTML_TEMPLATE = '''
             document.getElementById('stat-speed').textContent = '0 B/s';
             log('Error: ' + data.message, 'error');
             showAlert(data.message);
-            document.getElementById('start-btn').disabled = false;
-            document.getElementById('stop-btn').disabled = true;
+            setDownloadControls('idle');
         });
         
         function setDownloadStatus(message) {
@@ -1298,6 +1347,10 @@ HTML_TEMPLATE = '''
                 details.className = 'file-details';
                 item.appendChild(details);
             }
+            if (status !== 'downloading') {
+                item.querySelector('.part-metrics')?.remove();
+                item.querySelector('.transfer-progress')?.remove();
+            }
             const statusEl = item.querySelector('.file-status');
             statusEl.className = `file-status ${status}`;
             statusEl.textContent = status === 'not_found'
@@ -1313,9 +1366,23 @@ HTML_TEMPLATE = '''
             if (!status?.classList.contains('downloading')) return;
 
             status.textContent = `${part.percent.toFixed(1)}%`;
-            const transfer = `${formatBytes(part.downloaded)} / ${formatBytes(part.total)} · ${formatBytes(part.speed)}/s`;
-            const origin = part.resumed_from ? `Resumed from ${formatBytes(part.resumed_from)}` : 'New download';
-            item.querySelector('.file-details').textContent = `${transfer} · ${origin}`;
+            let metrics = item.querySelector('.part-metrics');
+            let progress = item.querySelector('.transfer-progress');
+            if (!metrics) {
+                const template = document.getElementById('part-progress-template');
+                item.appendChild(template.content.cloneNode(true));
+                metrics = item.querySelector('.part-metrics');
+                progress = item.querySelector('.transfer-progress');
+                const label = `Part ${String(part.index).padStart(3, '0')}`;
+                metrics.querySelector('.part-label').textContent = label;
+                progress.setAttribute('aria-label', `${label} download progress`);
+            }
+            metrics.querySelector('.part-bytes').textContent =
+                `${formatBytes(part.downloaded)} / ${formatBytes(part.total)}`;
+            metrics.querySelector('.part-speed').textContent = `${formatBytes(part.speed)}/s`;
+            progress.value = part.percent;
+            item.querySelector('.file-details').textContent = part.resumed_from
+                ? `Resumed from ${formatBytes(part.resumed_from)}` : 'New download';
         }
         
         // Fetch state on page load (backup in case socket is slow)
@@ -1416,17 +1483,7 @@ def api_status():
 @socketio.on('connect')
 def handle_connect():
     """Send current state to newly connected/reconnected clients."""
-    with state_lock:
-        if download_state['is_running'] or download_state['stats']['total_files'] > 0:
-            # Send current state to the reconnecting client
-            emit('restore_state', {
-                'is_running': download_state['is_running'],
-                'is_stopping': download_state['is_running'] and download_state['should_stop'],
-                'saved_partials': download_state['saved_partials'],
-                'stats': download_state['stats'],
-                'files': download_state['files'],
-                'log': download_state['log'],
-            })
+    handle_request_state()
 
 @socketio.on('request_state')
 def handle_request_state():
