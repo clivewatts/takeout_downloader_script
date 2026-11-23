@@ -130,8 +130,8 @@ The compose file uses:
   automatically). Set `DOWNLOADS_DIR=/path/to/downloads` to use another folder.
   Docker Desktop must be allowed to share that path (on macOS, paths under your
   home directory are shared by default).
-- `${WEB_PORT:-5001}` as the host port. Port 5000 is used by AirPlay Receiver on
-  macOS, so Docker defaults to 5001; set `WEB_PORT=5000` if you prefer.
+- `${WEB_PORT:-5001}` as the host port, bound to `127.0.0.1`. Port 5000 is used
+  by AirPlay Receiver on macOS, so Docker defaults to 5001.
 
 ```bash
 # Examples
@@ -145,7 +145,7 @@ Follow the logs with `docker compose logs -f`.
 
 ```bash
 docker build -t takeout-downloader .
-docker run -d -p 5001:5000 -v "$(pwd)/downloads:/downloads" takeout-downloader
+docker run -d -p 127.0.0.1:5001:5000 -v "$(pwd)/downloads:/downloads" takeout-downloader
 ```
 
 Open `http://localhost:5001`.
@@ -221,7 +221,7 @@ Google sessions expire after ~1 hour. When this happens:
 takeout.py            # Shared download engine + main entry point
 google_takeout_tui.py # TUI interface (textual)
 google_takeout_web.py # Web interface (Flask)
-dedupe_takeout.py     # Find/remove duplicate archives by size + sampled bytes
+dedupe_takeout.py     # Find/remove byte-identical archives
 requirements.txt      # Python dependencies
 requirements-dev.txt  # Test/build dependencies
 Dockerfile            # Docker image

@@ -79,6 +79,29 @@ def parse_content_length(headers) -> int:
     except (TypeError, ValueError):
         return 0
 
+
+def get_range_total(headers, offset: int) -> int:
+    """Return the archive size for a response covering the requested tail."""
+    match = re.fullmatch(r'bytes ([0-9]+)-([0-9]+)/([0-9]+)', headers.get('content-range', ''))
+    if not match or headers.get('content-encoding', 'identity').lower() != 'identity':
+        raise ValueError("Invalid partial response")
+
+    start, end, total = map(int, match.groups())
+    if not (start == offset <= end == total - 1):
+        raise ValueError("Content-Range does not match the requested archive tail")
+    if 'content-length' in headers and parse_content_length(headers) != total - offset:
+        raise ValueError("Content-Length does not match Content-Range")
+    return total
+
+
+def partial_matches_size(path: Path, size: int, expected: int, extension: str) -> bool:
+    """Check the size and archive signature before publishing a partial file."""
+    if size != expected or expected < MIN_ARCHIVE_SIZE:
+        return False
+    magic = get_magic_bytes(extension)
+    with path.open('rb') as file:
+        return not magic or file.read(len(magic)) == magic
+
 # =============================================================================
 # DATA CLASSES  
 # =============================================================================
@@ -475,6 +498,7 @@ class TakeoutDownloader:
         try:
             headers = {
                 'Cookie': self.cookie,
+                'Accept-Encoding': 'identity',
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             }
             
@@ -499,27 +523,26 @@ class TakeoutDownloader:
                 return False, "AUTH_FAILED"
             
             # 416 = Range Not Satisfiable (file might be complete or server doesn't support range)
-            if response.status_code == 416:
-                # Try without range header - file might be complete
-                if resume_from > 0:
-                    self._log(f"  [{filepath.name}] Range not satisfiable, checking if complete...")
-                    # Verify with a fresh request to get content-length
-                    head_resp = requests.head(
-                        url,
-                        headers={'Cookie': self.cookie, 'User-Agent': headers['User-Agent']},
-                        timeout=10,
-                    )
-                    try:
-                        if head_resp.status_code == 200:
-                            expected_size = parse_content_length(head_resp.headers)
-                            if expected_size > 0 and resume_from >= expected_size:
-                                # File is complete, move it into place
-                                os.replace(temp_path, filepath)
-                                self.size_history.record_size(filepath.name, resume_from)
-                                return True, "resumed-complete"
-                    finally:
-                        head_resp.close()
+            if response.status_code == 416 and resume_from > 0:
+                self._log(f"  [{filepath.name}] Range not satisfiable, checking if complete...")
+                # Verify with a fresh request to get content-length
+                head_resp = requests.head(
+                    url,
+                    headers={'Cookie': self.cookie, 'User-Agent': headers['User-Agent'], 'Accept-Encoding': 'identity'},
+                    timeout=10,
+                )
+                try:
+                    if head_resp.status_code == 200:
+                        expected_size = parse_content_length(head_resp.headers)
+                        if partial_matches_size(temp_path, resume_from, expected_size, self.extension):
+                            # File is complete, move it into place
+                            os.replace(temp_path, filepath)
+                            self.size_history.record_size(filepath.name, resume_from)
+                            return True, "resumed-complete"
+                finally:
+                    head_resp.close()
                 # Otherwise restart from scratch
+                response.close()
                 temp_path.unlink(missing_ok=True)
                 return self.download_file(num)  # Retry without resume
             
@@ -530,13 +553,11 @@ class TakeoutDownloader:
             if 'text/html' in content_type:
                 return False, "AUTH_FAILED"
             
-            # Get total size - for 206 Partial Content, content-length is remaining bytes
+            # Use Content-Range to verify the archive size on partial responses.
             content_length = parse_content_length(response.headers)
             
-            # For resumed downloads (206), total = resume_from + content_length
-            # For fresh downloads (200), total = content_length
             if response.status_code == 206:
-                total_size = resume_from + content_length
+                total_size = get_range_total(response.headers, resume_from)
             else:
                 total_size = content_length
                 # Fresh download - reset resume_from
@@ -560,6 +581,8 @@ class TakeoutDownloader:
                         return False, "STOPPED"
                     
                     if chunk:
+                        if total_size > 0 and downloaded + len(chunk) > total_size:
+                            return False, "Response exceeded the expected archive size"
                         # Check first chunk for archive magic bytes (only on fresh downloads)
                         if downloaded == 0:
                             magic = get_magic_bytes(self.extension)
@@ -578,6 +601,9 @@ class TakeoutDownloader:
             
             print()  # Newline after progress
             
+            if total_size > 0 and downloaded != total_size:
+                return False, "Downloaded size does not match the expected archive size"
+
             # Move into place (atomic, and works when the target exists on Windows)
             os.replace(temp_path, filepath)
             

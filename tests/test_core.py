@@ -8,9 +8,13 @@ import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import Mock
 from urllib.parse import urlparse
 
 import pytest
+import requests
+
+from dedupe_takeout import SAMPLE_SIZE, dedupe
 
 from takeout import (
     SizeHistory,
@@ -287,6 +291,84 @@ def test_downloader_rejects_non_archive_response(tmp_path, archive_server):
     assert success is False
     assert error == 'NOT_ARCHIVE'
     assert not downloader.get_filepath(1).exists()
+
+
+@pytest.mark.parametrize('mode', ['shared', 'web', 'tui'])
+@pytest.mark.parametrize('scenario', ['oversized', 'complete', 'wrong_offset', 'short_body'])
+def test_archive_resume_validation(tmp_path, monkeypatch, mode, scenario):
+    import google_takeout_web as web
+    from google_takeout_tui import TakeoutTUI
+
+    downloader = make_downloader(tmp_path, 'https://takeout.google.com')
+    filepath = downloader.get_filepath(1)
+    partial = get_temp_path(filepath)
+    url = downloader.get_url(1)
+    partial_data = SAMPLE_ZIP[:40]
+
+    def response(status, headers, body=b''):
+        reply = requests.Response()
+        reply.url = url
+        reply.status_code = status
+        reply.headers.update(headers)
+        reply.iter_content = Mock(return_value=iter([body]))
+        reply.close = Mock()
+        return reply
+
+    if scenario in ('oversized', 'complete'):
+        partial_data = SAMPLE_ZIP + (b'extra' if scenario == 'oversized' else b'')
+        headers = {'Content-Length': str(len(SAMPLE_ZIP))}
+        get = Mock(side_effect=[response(416, {}), response(200, headers, SAMPLE_ZIP)])
+        monkeypatch.setattr(requests, 'head', Mock(return_value=response(200, headers)))
+    else:
+        start = 41 if scenario == 'wrong_offset' else 40
+        headers = {'Content-Range': f'bytes {start}-{len(SAMPLE_ZIP) - 1}/{len(SAMPLE_ZIP)}'}
+        get = Mock(return_value=response(206, headers, SAMPLE_ZIP[start:-1]))
+    monkeypatch.setattr(requests, 'get', get)
+    partial.write_bytes(partial_data)
+
+    if mode == 'web':
+        monkeypatch.setitem(web.download_state, 'should_stop', False)
+        monkeypatch.setitem(web.download_state, 'files', [])
+        monkeypatch.setitem(web.download_state, 'stats', {'bytes_downloaded': 0})
+        monkeypatch.setattr(web, 'emit_status', Mock())
+        monkeypatch.setattr(web, 'add_log', Mock())
+        result = web.download_file(url, filepath, 1, downloader.cookie, downloader.size_history)
+        success = result['success']
+    elif mode == 'tui':
+        app = TakeoutTUI()
+        app.downloader = downloader
+        monkeypatch.setattr(app, 'call_from_thread', Mock())
+        success, _ = app.download_file(1)
+    else:
+        success, _ = downloader.download_file(1)
+
+    assert get.call_args_list[0].kwargs['headers']['Range'] == f'bytes={len(partial_data)}-'
+    if scenario in ('oversized', 'complete'):
+        assert success
+        assert filepath.read_bytes() == SAMPLE_ZIP
+        assert not partial.exists()
+        assert get.call_count == (2 if scenario == 'oversized' else 1)
+        if scenario == 'oversized':
+            assert 'Range' not in get.call_args.kwargs['headers']
+    else:
+        assert not success
+        assert not filepath.exists()
+        assert partial.read_bytes() == (partial_data if scenario == 'wrong_offset' else SAMPLE_ZIP[:-1])
+
+
+def test_dedupe_preserves_archives_that_differ_outside_samples(tmp_path):
+    prefix = b'PK' + b'A' * (SAMPLE_SIZE - 2)
+    suffix = b'Z' * SAMPLE_SIZE
+    original = prefix + b'1' + suffix
+    distinct = prefix + b'2' + suffix
+    (tmp_path / 'a.zip').write_bytes(original)
+    (tmp_path / 'b.zip').write_bytes(distinct)
+    (tmp_path / 'c.zip').write_bytes(original)
+
+    assert dedupe(tmp_path) == (1, len(original))
+    assert (tmp_path / 'a.zip').read_bytes() == original
+    assert (tmp_path / 'b.zip').read_bytes() == distinct
+    assert not (tmp_path / 'c.zip').exists()
 
 
 # ---------------------------------------------------------------------------

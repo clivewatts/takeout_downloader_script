@@ -2,8 +2,8 @@
 """
 Takeout Deduplication Script
 =============================
-Finds and removes duplicate ZIP files by comparing size + first/last bytes.
-Much faster than full hashing for large files.
+Finds and removes byte-identical archives. Size and sampled bytes narrow
+the candidates before comparing their full contents.
 
 Usage:
     python dedupe_takeout.py /path/to/takeout/folder
@@ -59,6 +59,17 @@ def signatures_match(sig1, sig2):
     return True
 
 
+def files_match(first, second):
+    """Compare candidate archives byte for byte with bounded memory."""
+    with first.open('rb') as first_file, second.open('rb') as second_file:
+        while True:
+            chunk = first_file.read(1024 * 1024)
+            if chunk != second_file.read(1024 * 1024):
+                return False
+            if not chunk:
+                return True
+
+
 def find_duplicates(folder):
     """Find all archive files and group potential duplicates by size first."""
     # Get all archive files sorted by name (so lower numbers come first)
@@ -80,6 +91,8 @@ def find_duplicates(folder):
     size_groups = defaultdict(list)
     for i, filepath in enumerate(zip_files, 1):
         try:
+            if filepath.is_symlink() or not filepath.is_file():
+                continue
             size = filepath.stat().st_size
             size_groups[size].append(filepath)
             # Show progress every 50 files or at the end
@@ -136,12 +149,16 @@ def find_duplicates(folder):
                 continue
             
             dupes_for_file = []
-            for j, (file2, sig2) in enumerate(signatures[i+1:], i+1):
+            for file2, sig2 in signatures[i+1:]:
                 if file2 in matched:
                     continue
                 if signatures_match(sig1, sig2):
-                    dupes_for_file.append(file2)
-                    matched.add(file2)
+                    try:
+                        if files_match(file1, file2):
+                            dupes_for_file.append(file2)
+                            matched.add(file2)
+                    except OSError as e:
+                        print(f"    Error comparing {file1.name} and {file2.name}: {e}")
             
             if dupes_for_file:
                 matched.add(file1)

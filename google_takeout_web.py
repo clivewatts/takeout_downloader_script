@@ -20,6 +20,7 @@ from flask_socketio import SocketIO, emit
 from takeout import (
     SizeHistory, extract_url_parts, extract_cookie_from_curl, extract_url_from_curl,
     get_magic_bytes, get_temp_path, build_file_url, parse_content_length,
+    get_range_total, partial_matches_size,
     CHUNK_SIZE, MAX_PARALLEL, MAX_FILE_COUNT, MIN_ARCHIVE_SIZE,
 )
 import requests
@@ -140,6 +141,7 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
     try:
         headers = {
             'Cookie': cookie,
+            'Accept-Encoding': 'identity',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         }
         
@@ -173,26 +175,26 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
             return result
         
         # 416 = Range Not Satisfiable (file might be complete)
-        if response.status_code == 416:
-            if resume_from > 0:
-                # Verify with HEAD request
-                head_resp = requests.head(
-                    url,
-                    headers={'Cookie': cookie, 'User-Agent': headers['User-Agent']},
-                    timeout=10,
-                )
-                try:
-                    if head_resp.status_code == 200:
-                        expected_size = parse_content_length(head_resp.headers)
-                        if expected_size > 0 and resume_from >= expected_size:
-                            os.replace(temp_path, output_path)
-                            size_history.record_size(filename, resume_from)
-                            result['success'] = True
-                            result['message'] = 'Resumed complete'
-                            result['size'] = resume_from
-                            return result
-                finally:
-                    head_resp.close()
+        if response.status_code == 416 and resume_from > 0:
+            # Verify with HEAD request
+            head_resp = requests.head(
+                url,
+                headers={'Cookie': cookie, 'User-Agent': headers['User-Agent'], 'Accept-Encoding': 'identity'},
+                timeout=10,
+            )
+            try:
+                if head_resp.status_code == 200:
+                    expected_size = parse_content_length(head_resp.headers)
+                    if partial_matches_size(temp_path, resume_from, expected_size, extension):
+                        os.replace(temp_path, output_path)
+                        size_history.record_size(filename, resume_from)
+                        result['success'] = True
+                        result['message'] = 'Resumed complete'
+                        result['size'] = resume_from
+                        return result
+            finally:
+                head_resp.close()
+            response.close()
             temp_path.unlink(missing_ok=True)
             # Retry without resume (recursive call with fresh state)
             return download_file(url, output_path, file_index, cookie, size_history, extension)
@@ -205,11 +207,11 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
             result['auth_failed'] = True
             return result
         
-        # Get total size - for 206 Partial Content, content-length is remaining bytes
+        # Use Content-Range to verify the archive size on partial responses.
         content_length = parse_content_length(response.headers)
         
         if response.status_code == 206:
-            total_size = resume_from + content_length
+            total_size = get_range_total(response.headers, resume_from)
         else:
             total_size = content_length
             if resume_from > 0:
@@ -255,6 +257,9 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
                     return result
 
                 if chunk:
+                    if total_size > 0 and downloaded + len(chunk) > total_size:
+                        result['message'] = 'Response exceeded the expected archive size'
+                        return result
                     # Check first chunk for archive magic bytes (only on fresh downloads)
                     if downloaded == 0:
                         magic = get_magic_bytes(extension)
@@ -288,6 +293,10 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
                         emit_status('stats_update', download_state['stats'])
                         last_emit_time = now
         
+        if total_size > 0 and downloaded != total_size:
+            result['message'] = 'Downloaded size does not match the expected archive size'
+            return result
+
         # Move into place (atomic, and works when the target exists on Windows)
         os.replace(temp_path, output_path)
         size_history.record_size(filename, downloaded)

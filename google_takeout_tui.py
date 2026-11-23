@@ -30,6 +30,7 @@ import requests
 from takeout import (
     TakeoutDownloader, DownloadStats,
     get_magic_bytes, get_temp_path, parse_content_length,
+    get_range_total, partial_matches_size,
     VERSION, CHUNK_SIZE, DEFAULT_FILE_COUNT, DEFAULT_OUTPUT_DIR, DEFAULT_PARALLEL,
     MAX_PARALLEL, MAX_FILE_COUNT, MIN_ARCHIVE_SIZE
 )
@@ -417,6 +418,7 @@ class TakeoutTUI(App):
         try:
             headers = {
                 'Cookie': self.downloader.cookie,
+                'Accept-Encoding': 'identity',
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             }
             
@@ -442,23 +444,23 @@ class TakeoutTUI(App):
                 return False, "AUTH_FAILED"
             
             # 416 = Range Not Satisfiable (file might be complete)
-            if response.status_code == 416:
-                if resume_from > 0:
-                    # Verify with HEAD request
-                    head_resp = requests.head(
-                        url,
-                        headers={'Cookie': self.downloader.cookie, 'User-Agent': headers['User-Agent']},
-                        timeout=10,
-                    )
-                    try:
-                        if head_resp.status_code == 200:
-                            expected_size = parse_content_length(head_resp.headers)
-                            if expected_size > 0 and resume_from >= expected_size:
-                                os.replace(temp_path, filepath)
-                                self.downloader.size_history.record_size(filename, resume_from)
-                                return True, "resumed-complete"
-                    finally:
-                        head_resp.close()
+            if response.status_code == 416 and resume_from > 0:
+                # Verify with HEAD request
+                head_resp = requests.head(
+                    url,
+                    headers={'Cookie': self.downloader.cookie, 'User-Agent': headers['User-Agent'], 'Accept-Encoding': 'identity'},
+                    timeout=10,
+                )
+                try:
+                    if head_resp.status_code == 200:
+                        expected_size = parse_content_length(head_resp.headers)
+                        if partial_matches_size(temp_path, resume_from, expected_size, self.downloader.extension):
+                            os.replace(temp_path, filepath)
+                            self.downloader.size_history.record_size(filename, resume_from)
+                            return True, "resumed-complete"
+                finally:
+                    head_resp.close()
+                response.close()
                 temp_path.unlink(missing_ok=True)
                 # Retry without resume
                 with self._lock:
@@ -471,11 +473,11 @@ class TakeoutTUI(App):
             if 'text/html' in content_type:
                 return False, "AUTH_FAILED"
             
-            # Get total size - for 206 Partial Content, content-length is remaining bytes
+            # Use Content-Range to verify the archive size on partial responses.
             content_length = parse_content_length(response.headers)
             
             if response.status_code == 206:
-                total_size = resume_from + content_length
+                total_size = get_range_total(response.headers, resume_from)
             else:
                 total_size = content_length
                 if resume_from > 0:
@@ -505,6 +507,8 @@ class TakeoutTUI(App):
                         return False, "STOPPED"
                     
                     if chunk:
+                        if total_size > 0 and downloaded + len(chunk) > total_size:
+                            return False, "Response exceeded the expected archive size"
                         # Check first chunk for archive magic bytes (only on fresh downloads)
                         if downloaded == 0:
                             magic = get_magic_bytes(self.downloader.extension)
@@ -527,6 +531,9 @@ class TakeoutTUI(App):
                             self.call_from_thread(self.update_stats_display)
                             last_update = now
             
+            if total_size > 0 and downloaded != total_size:
+                return False, "Downloaded size does not match the expected archive size"
+
             os.replace(temp_path, filepath)
             self.downloader.size_history.record_size(filename, downloaded)
             
