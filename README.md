@@ -43,9 +43,12 @@ python takeout.py --web
 ### Docker (Web Interface)
 
 ```bash
-docker-compose up -d
-# Open http://localhost:5000
+docker compose up -d
+# Open http://localhost:5001
 ```
+
+Downloads are written to `./downloads` next to `docker-compose.yml`. See
+[Docker](#docker) for ports and volume options.
 
 ## Installation
 
@@ -116,17 +119,36 @@ Options:
 ### Using Docker Compose (Recommended)
 
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
-Open `http://localhost:5000`
+Open `http://localhost:5001`
+
+The compose file uses:
+
+- `${DOWNLOADS_DIR:-./downloads}` as the host download directory (created
+  automatically). Set `DOWNLOADS_DIR=/path/to/downloads` to use another folder.
+  Docker Desktop must be allowed to share that path (on macOS, paths under your
+  home directory are shared by default).
+- `${WEB_PORT:-5001}` as the host port. Port 5000 is used by AirPlay Receiver on
+  macOS, so Docker defaults to 5001; set `WEB_PORT=5000` if you prefer.
+
+```bash
+# Examples
+DOWNLOADS_DIR=~/takeout docker compose up -d
+WEB_PORT=8080 docker compose up -d
+```
+
+Follow the logs with `docker compose logs -f`.
 
 ### Manual Docker
 
 ```bash
 docker build -t takeout-downloader .
-docker run -d -p 5000:5000 -v $(pwd)/downloads:/downloads takeout-downloader
+docker run -d -p 5001:5000 -v "$(pwd)/downloads:/downloads" takeout-downloader
 ```
+
+Open `http://localhost:5001`.
 
 ### Environment Variables
 

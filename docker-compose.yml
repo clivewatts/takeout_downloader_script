@@ -1,15 +1,16 @@
-version: '3.8'
-
 services:
   takeout-downloader:
     build: .
     container_name: takeout-downloader
     restart: unless-stopped
     ports:
-      - "5000:5000"
+      # Host port 5001 by default: macOS uses 5000 for AirPlay Receiver.
+      # Override with WEB_PORT=5000 docker compose up -d
+      - "${WEB_PORT:-5001}:5000"
     volumes:
-      # Mount your downloads directory (change path as needed)
-      - /smb/takeout:/downloads
+      # Host directory for downloaded archives (created automatically).
+      # Override with DOWNLOADS_DIR=/path/to/downloads
+      - "${DOWNLOADS_DIR:-./downloads}:/downloads"
     environment:
       - OUTPUT_DIR=/downloads
       - PARALLEL_DOWNLOADS=2
