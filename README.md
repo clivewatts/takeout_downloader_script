@@ -8,7 +8,7 @@
 
 A simple, robust tool to bulk download Google Takeout archives. Available as **TUI** (Terminal UI) and **Web interface**.
 
-![Version](https://img.shields.io/badge/Version-4.2.0-blue) ![TUI](https://img.shields.io/badge/TUI-Default-green) ![Web](https://img.shields.io/badge/Web-Available-blue) ![Docker](https://img.shields.io/badge/Docker-Ready-2496ED) ![Python](https://img.shields.io/badge/Python-3.8+-blue) ![Platform](https://img.shields.io/badge/Platform-Linux%20|%20Windows%20|%20macOS-orange)
+![Version](https://img.shields.io/badge/Version-4.3.0-blue) ![TUI](https://img.shields.io/badge/TUI-Default-green) ![Web](https://img.shields.io/badge/Web-Available-blue) ![Docker](https://img.shields.io/badge/Docker-Ready-2496ED) ![Python](https://img.shields.io/badge/Python-3.8+-blue) ![Platform](https://img.shields.io/badge/Platform-Linux%20|%20Windows%20|%20macOS-orange)
 
 ## Features
 
@@ -89,10 +89,15 @@ python takeout.py
 
 ```bash
 python takeout.py --web
-python takeout.py --web --port 8080  # Custom port
+python takeout.py --web --port 8080          # Custom port
+python takeout.py --web --host 0.0.0.0       # Expose on the LAN (no auth!)
 ```
 
 Open `http://localhost:5000` in your browser.
+
+The web server binds to `127.0.0.1` by default. It has **no authentication** and
+accepts an arbitrary output directory, so only bind it to a non-loopback
+address on a trusted network.
 
 ### Command-Line Options
 
@@ -102,7 +107,7 @@ python takeout.py [OPTIONS]
 Options:
   --web           Start web interface instead of TUI
   --port PORT     Web server port (default: 5000)
-  --host HOST     Web server host (default: 0.0.0.0)
+  --host HOST     Web server host (default: 127.0.0.1)
   -v, --version   Show version
 ```
 
@@ -127,9 +132,11 @@ docker run -d -p 5000:5000 -v $(pwd)/downloads:/downloads takeout-downloader
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `OUTPUT_DIR` | Download directory | `/downloads` |
-| `PARALLEL_DOWNLOADS` | Concurrent downloads | `6` |
-| `FILE_COUNT` | Max files to download | `100` |
+| `OUTPUT_DIR` | Download directory | `/downloads` (Docker) / `./downloads` |
+| `PARALLEL_DOWNLOADS` | Concurrent downloads (1-20) | `6` |
+| `FILE_COUNT` | Max archive parts to look for | `100` |
+| `SECRET_KEY` | Flask session secret | random per start |
+| `CORS_ALLOWED_ORIGINS` | Comma-separated Socket.IO origins | same-origin |
 
 ## Pre-built Binaries
 
@@ -137,19 +144,19 @@ Download the latest release for your platform (no Python required):
 
 | Platform | Download |
 |----------|----------|
-| **Linux** | [takeout-linux-x64](https://github.com/clivewatts/takeout_downloader_script/releases/latest/download/takeout-linux-x64) |
-| **Windows** | [takeout-windows-x64.exe](https://github.com/clivewatts/takeout_downloader_script/releases/latest/download/takeout-windows-x64.exe) |
-| **macOS** | [takeout-macos-x64](https://github.com/clivewatts/takeout_downloader_script/releases/latest/download/takeout-macos-x64) |
+| **Linux** | [Google_Takeout_Downloader-linux-x64](https://github.com/clivewatts/takeout_downloader_script/releases/latest/download/Google_Takeout_Downloader-linux-x64) |
+| **Windows** | [Google_Takeout_Downloader-windows-x64.exe](https://github.com/clivewatts/takeout_downloader_script/releases/latest/download/Google_Takeout_Downloader-windows-x64.exe) |
+| **macOS** | [Google_Takeout_Downloader-macos-x64](https://github.com/clivewatts/takeout_downloader_script/releases/latest/download/Google_Takeout_Downloader-macos-x64) |
 
 ```bash
 # Linux/macOS
-chmod +x takeout-linux-x64
-./takeout-linux-x64              # TUI mode
-./takeout-linux-x64 --web        # Web mode
+chmod +x Google_Takeout_Downloader-linux-x64
+./Google_Takeout_Downloader-linux-x64              # TUI mode
+./Google_Takeout_Downloader-linux-x64 --web        # Web mode
 
 # Windows
-takeout-windows-x64.exe          # TUI mode
-takeout-windows-x64.exe --web    # Web mode
+Google_Takeout_Downloader-windows-x64.exe          # TUI mode
+Google_Takeout_Downloader-windows-x64.exe --web    # Web mode
 ```
 
 ## Building from Source
@@ -189,13 +196,15 @@ Google sessions expire after ~1 hour. When this happens:
 ## Files
 
 ```
-takeout.py           # Main entry point
-google_takeout_tui.py   # TUI interface (textual)
-google_takeout_web.py   # Web interface (Flask)
-requirements.txt     # Python dependencies
-Dockerfile          # Docker image
-docker-compose.yml  # Docker Compose config
-build.py            # Build script for standalone binary
+takeout.py            # Shared download engine + main entry point
+google_takeout_tui.py # TUI interface (textual)
+google_takeout_web.py # Web interface (Flask)
+dedupe_takeout.py     # Find/remove duplicate archives by size + sampled bytes
+requirements.txt      # Python dependencies
+requirements-dev.txt  # Test/build dependencies
+Dockerfile            # Docker image
+docker-compose.yml    # Docker Compose config
+build.py              # Build script for standalone binary
 ```
 
 ## License

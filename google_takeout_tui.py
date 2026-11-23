@@ -5,13 +5,13 @@ A beautiful terminal user interface for downloading Google Takeout archives.
 
 Usage:
     python google_takeout_tui.py
-    # Or via main script:
-    python takeout.py --tui
+    # Or via main script (TUI is the default):
+    python takeout.py
 """
 
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict
 from dataclasses import dataclass
@@ -28,10 +28,10 @@ from textual import work
 import requests
 
 from takeout import (
-    TakeoutDownloader, SizeHistory, DownloadStats,
-    extract_url_parts, extract_cookie_from_curl, extract_url_from_curl,
-    get_magic_bytes,
-    VERSION, CHUNK_SIZE, DEFAULT_FILE_COUNT, DEFAULT_OUTPUT_DIR, DEFAULT_PARALLEL, MAX_PARALLEL
+    TakeoutDownloader, DownloadStats,
+    get_magic_bytes, get_temp_path, parse_content_length,
+    VERSION, CHUNK_SIZE, DEFAULT_FILE_COUNT, DEFAULT_OUTPUT_DIR, DEFAULT_PARALLEL,
+    MAX_PARALLEL, MAX_FILE_COUNT, MIN_ARCHIVE_SIZE
 )
 
 
@@ -203,6 +203,7 @@ class TakeoutTUI(App):
             f"[bold green]✓ Done:[/] {self.stats.completed_files}  "
             f"[bold red]✗ Failed:[/] {self.stats.failed_files}  "
             f"[bold yellow]⊘ Skip:[/] {self.stats.skipped_files}  "
+            f"[bold yellow]? Missing:[/] {self.stats.not_found_files}  "
             f"[bold cyan]↓[/] {mb:.1f} MB  "
             f"[bold magenta]⚡[/] {speed:.1f} MB/s  "
             f"[bold]Active:[/] {len(self.active_downloads)}"
@@ -260,7 +261,7 @@ class TakeoutTUI(App):
         output_dir = self.query_one("#output-input", Input).value.strip() or DEFAULT_OUTPUT_DIR
         
         try:
-            file_count = int(self.query_one("#count-input", Input).value.strip() or DEFAULT_FILE_COUNT)
+            file_count = min(max(1, int(self.query_one("#count-input", Input).value.strip() or DEFAULT_FILE_COUNT)), MAX_FILE_COUNT)
         except ValueError:
             file_count = DEFAULT_FILE_COUNT
         
@@ -274,7 +275,7 @@ class TakeoutTUI(App):
             return
         
         # Create downloader
-        self.downloader = TakeoutDownloader(output_dir, parallel)
+        self.downloader = TakeoutDownloader(output_dir, parallel, log_fn=self._log_from_anywhere)
         
         if not self.downloader.set_curl(curl_text):
             self.log_message("ERROR: Failed to parse cURL!", "error")
@@ -293,7 +294,18 @@ class TakeoutTUI(App):
         
         # Start download
         self.run_download(file_count, parallel)
-    
+
+    def _log_from_anywhere(self, message: str) -> None:
+        """Write a log line from either the UI thread or a worker thread."""
+        try:
+            if threading.current_thread() is threading.main_thread():
+                self.log_message(message)
+            else:
+                self.call_from_thread(self.log_message, message)
+        except RuntimeError:
+            # App is shutting down; the message is not worth crashing over.
+            pass
+
     @work(thread=True)
     def run_download(self, file_count: int, parallel: int) -> None:
         """Run downloads in background thread."""
@@ -304,76 +316,80 @@ class TakeoutTUI(App):
         self.downloader.should_stop = False
         self.downloader.auth_failed = False
         
-        while not self.downloader.should_stop:
-            # Clean up bad files
-            self.call_from_thread(self.log_message, "Checking files...")
-            first_needed = self.downloader.cleanup_bad_files()
+        # Clean up bad files
+        self.call_from_thread(self.log_message, "Checking files...")
+        first_needed = self.downloader.cleanup_bad_files()
+
+        # Build download list
+        to_download = []
+        skipped = 0
+        for num in range(first_needed, file_count + 1):
+            filepath = self.downloader.get_filepath(num)
+            if filepath.exists() and filepath.stat().st_size > 0:
+                expected = self.downloader.size_history.get_expected_size(filepath.name)
+                if not expected or filepath.stat().st_size >= expected:
+                    skipped += 1
+                    continue
+            to_download.append(num)
+        self.stats.skipped_files = skipped
+
+        self.call_from_thread(self.update_stats_display)
+
+        if not to_download:
+            self.call_from_thread(self.log_message, "All files downloaded!")
+            self.call_from_thread(self.download_complete)
+            return
+
+        self.call_from_thread(self.log_message, f"Downloading {len(to_download)} files...")
+
+        # Parallel downloads
+        with ThreadPoolExecutor(max_workers=parallel) as executor:
+            futures = {executor.submit(self.download_file, num): num for num in to_download}
             
-            # Build download list
-            to_download = []
-            for num in range(first_needed, file_count + 1):
-                filepath = self.downloader.get_filepath(num)
-                if filepath.exists() and filepath.stat().st_size > 0:
-                    expected = self.downloader.size_history.get_expected_size(filepath.name)
-                    if not expected or filepath.stat().st_size >= expected:
-                        self.stats.skipped_files += 1
-                        continue
-                to_download.append(num)
-            
-            self.call_from_thread(self.update_stats_display)
-            
-            if not to_download:
-                self.call_from_thread(self.log_message, "All files downloaded!")
-                break
-            
-            self.call_from_thread(self.log_message, f"Downloading {len(to_download)} files...")
-            self.downloader.auth_failed = False
-            
-            # Parallel downloads
-            with ThreadPoolExecutor(max_workers=parallel) as executor:
-                futures = {executor.submit(self.download_file, num): num for num in to_download}
+            for future in as_completed(futures):
+                if self.downloader.should_stop or self.downloader.auth_failed:
+                    for f in futures:
+                        f.cancel()
+                    break
                 
-                for future in as_completed(futures):
-                    if self.downloader.should_stop or self.downloader.auth_failed:
-                        for f in futures:
-                            f.cancel()
-                        break
-                    
-                    num = futures[future]
-                    try:
-                        success, error = future.result()
-                        filename = self.downloader.get_filename(num)
-                        
-                        # Remove from active
-                        with self._lock:
-                            self.active_downloads.pop(filename, None)
-                        
-                        if success:
-                            self.call_from_thread(self.log_message, f"✓ {filename}")
-                            self.stats.completed_files += 1
-                        elif error == "AUTH_FAILED":
-                            self.call_from_thread(self.log_message, f"✗ {filename}: Auth failed!")
-                            self.downloader.auth_failed = True
-                        elif error == "NOT_FOUND":
-                            self.call_from_thread(self.log_message, f"⊘ {filename}: Not found")
-                        else:
-                            self.call_from_thread(self.log_message, f"✗ {filename}: {error}")
-                            self.stats.failed_files += 1
-                        
-                        self.call_from_thread(self.update_stats_display)
-                        self.call_from_thread(self.update_downloads_table)
-                        
-                    except Exception as e:
-                        self.call_from_thread(self.log_message, f"✗ Error: {e}")
-                        self.stats.failed_files += 1
-            
-            if self.downloader.auth_failed:
-                self.call_from_thread(self.handle_auth_failure)
-                break
-            else:
-                break
+                num = futures[future]
+                filename = self.downloader.get_filename(num)
+
+                # Remove from active
+                with self._lock:
+                    self.active_downloads.pop(filename, None)
+
+                try:
+                    success, error = future.result()
+                except Exception as e:
+                    self.call_from_thread(self.log_message, f"✗ {filename}: {e}")
+                    self.stats.failed_files += 1
+                    self.call_from_thread(self.update_stats_display)
+                    self.call_from_thread(self.update_downloads_table)
+                    continue
+
+                if success:
+                    self.call_from_thread(self.log_message, f"✓ {filename}")
+                    self.stats.completed_files += 1
+                elif error == "AUTH_FAILED":
+                    self.call_from_thread(self.log_message, f"✗ {filename}: Auth failed!")
+                    self.downloader.auth_failed = True
+                elif error == "NOT_FOUND":
+                    self.call_from_thread(self.log_message, f"⊘ {filename}: Not found")
+                    self.stats.not_found_files += 1
+                elif error == "STOPPED":
+                    pass
+                else:
+                    self.call_from_thread(self.log_message, f"✗ {filename}: {error}")
+                    self.stats.failed_files += 1
+
+                self.call_from_thread(self.update_stats_display)
+                self.call_from_thread(self.update_downloads_table)
         
-        self.call_from_thread(self.download_complete)
+        if self.downloader.auth_failed:
+            self.call_from_thread(self.handle_auth_failure)
+        else:
+            self.call_from_thread(self.download_complete)
     
     def download_file(self, num: int) -> tuple:
         """Download a single file with progress updates and resume support."""
@@ -384,7 +400,7 @@ class TakeoutTUI(App):
         url = self.downloader.get_url(num)
         filename = filepath.name
         
-        temp_path = filepath.with_suffix('.downloading')
+        temp_path = get_temp_path(filepath)
         resume_from = 0
         
         # Check for existing partial download to resume
@@ -397,6 +413,7 @@ class TakeoutTUI(App):
             self.active_downloads[filename] = ActiveDownload(filename=filename, status=status, downloaded=resume_from)
         self.call_from_thread(self.update_downloads_table)
         
+        response = None
         try:
             headers = {
                 'Cookie': self.downloader.cookie,
@@ -428,13 +445,20 @@ class TakeoutTUI(App):
             if response.status_code == 416:
                 if resume_from > 0:
                     # Verify with HEAD request
-                    head_resp = requests.head(url, headers={'Cookie': self.downloader.cookie, 'User-Agent': headers['User-Agent']}, timeout=10)
-                    if head_resp.status_code == 200:
-                        expected_size = int(head_resp.headers.get('content-length', 0))
-                        if expected_size > 0 and resume_from >= expected_size:
-                            temp_path.rename(filepath)
-                            self.downloader.size_history.record_size(filename, resume_from)
-                            return True, "resumed-complete"
+                    head_resp = requests.head(
+                        url,
+                        headers={'Cookie': self.downloader.cookie, 'User-Agent': headers['User-Agent']},
+                        timeout=10,
+                    )
+                    try:
+                        if head_resp.status_code == 200:
+                            expected_size = parse_content_length(head_resp.headers)
+                            if expected_size > 0 and resume_from >= expected_size:
+                                os.replace(temp_path, filepath)
+                                self.downloader.size_history.record_size(filename, resume_from)
+                                return True, "resumed-complete"
+                    finally:
+                        head_resp.close()
                 temp_path.unlink(missing_ok=True)
                 # Retry without resume
                 with self._lock:
@@ -448,7 +472,7 @@ class TakeoutTUI(App):
                 return False, "AUTH_FAILED"
             
             # Get total size - for 206 Partial Content, content-length is remaining bytes
-            content_length = int(response.headers.get('content-length', 0))
+            content_length = parse_content_length(response.headers)
             
             if response.status_code == 206:
                 total_size = resume_from + content_length
@@ -458,8 +482,8 @@ class TakeoutTUI(App):
                     # Server doesn't support resume, start fresh
                     resume_from = 0
             
-            if total_size < 1000 and resume_from == 0:
-                return False, "AUTH_FAILED"
+            if total_size < MIN_ARCHIVE_SIZE and resume_from == 0:
+                return False, "EMPTY_RESPONSE"
             
             # Update active download info
             with self._lock:
@@ -476,21 +500,22 @@ class TakeoutTUI(App):
             
             with open(temp_path, file_mode) as f:
                 for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-                    if self.downloader.should_stop:
+                    if self.downloader.should_stop or self.downloader.auth_failed:
                         # Keep partial file for resume on stop
-                        return False, "Stopped"
+                        return False, "STOPPED"
                     
                     if chunk:
                         # Check first chunk for archive magic bytes (only on fresh downloads)
                         if downloaded == 0:
                             magic = get_magic_bytes(self.downloader.extension)
                             if magic and chunk[:len(magic)] != magic:
-                                temp_path.unlink()
-                                return False, "AUTH_FAILED"
+                                temp_path.unlink(missing_ok=True)
+                                return False, "NOT_ARCHIVE"
                         
                         f.write(chunk)
                         downloaded += len(chunk)
-                        self.stats.bytes_downloaded += len(chunk)
+                        with self._lock:
+                            self.stats.bytes_downloaded += len(chunk)
                         
                         # Update progress every 300ms
                         now = datetime.now()
@@ -502,19 +527,24 @@ class TakeoutTUI(App):
                             self.call_from_thread(self.update_stats_display)
                             last_update = now
             
-            temp_path.rename(filepath)
+            os.replace(temp_path, filepath)
             self.downloader.size_history.record_size(filename, downloaded)
             
             return True, ""
             
         except requests.exceptions.HTTPError as e:
-            if e.response and e.response.status_code == 404:
+            if e.response is not None and e.response.status_code == 404:
                 return False, "NOT_FOUND"
             # Keep partial file for resume
             return False, str(e)
         except requests.exceptions.RequestException as e:
             # Keep partial file for resume
             return False, str(e)
+        except (OSError, ValueError) as e:
+            return False, f"Local error: {e}"
+        finally:
+            if response is not None:
+                response.close()
     
     def handle_auth_failure(self):
         """Handle authentication failure."""

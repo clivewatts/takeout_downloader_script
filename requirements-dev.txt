@@ -1,3 +1,8 @@
 # Development dependencies
-requests>=2.28.0
+-r requirements.txt
+
+# Tests
+pytest>=8.0.0
+
+# For building single binary
 pyinstaller>=6.0.0

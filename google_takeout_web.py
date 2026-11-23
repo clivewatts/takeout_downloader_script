@@ -7,7 +7,7 @@ This module can be run standalone or launched via: python takeout.py --web
 """
 
 import os
-import re
+import secrets
 import threading
 import time
 from pathlib import Path
@@ -19,8 +19,8 @@ from flask_socketio import SocketIO, emit
 # Import shared core
 from takeout import (
     SizeHistory, extract_url_parts, extract_cookie_from_curl, extract_url_from_curl,
-    get_magic_bytes,
-    CHUNK_SIZE
+    get_magic_bytes, get_temp_path, build_file_url, parse_content_length,
+    CHUNK_SIZE, MAX_PARALLEL, MAX_FILE_COUNT, MIN_ARCHIVE_SIZE,
 )
 import requests
 
@@ -28,19 +28,40 @@ import requests
 # CONFIGURATION
 # ============================================================================
 
+def _cors_origins():
+    """Allowed Socket.IO origins; None keeps flask-socketio's same-origin default."""
+    value = os.environ.get('CORS_ALLOWED_ORIGINS')
+    if not value:
+        return None
+    return [origin.strip() for origin in value.split(',') if origin.strip()]
+
+
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'takeout-downloader-secret')
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY') or secrets.token_hex(32)
+socketio = SocketIO(
+    app,
+    cors_allowed_origins=_cors_origins(),
+    async_mode='threading',
+)
 
 # Default settings
-DEFAULT_OUTPUT_DIR = os.environ.get('OUTPUT_DIR', '/downloads')
+DEFAULT_OUTPUT_DIR = os.environ.get('OUTPUT_DIR', './downloads')
 DEFAULT_PARALLEL = int(os.environ.get('PARALLEL_DOWNLOADS', '6'))
 DEFAULT_FILE_COUNT = int(os.environ.get('FILE_COUNT', '100'))
+
+
+def _clamp_int(value, default: int, minimum: int, maximum: int) -> int:
+    """Coerce a JSON value to a bounded int, falling back to a default."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, number))
 
 # Download state
 download_state = {
     'is_running': False,
-    'should_stop': False,  # Flag to stop downloads on auth failure
+    'should_stop': False,  # Set by /api/stop and checked by the download workers
     'cookie': '',
     'url': '',
     'output_dir': DEFAULT_OUTPUT_DIR,
@@ -52,6 +73,7 @@ download_state = {
         'completed_files': 0,
         'failed_files': 0,
         'skipped_files': 0,
+        'not_found_files': 0,
         'bytes_downloaded': 0,
         'start_time': None,
     },
@@ -102,16 +124,19 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
         'success': False,
         'message': '',
         'auth_failed': False,
+        'not_found': False,
+        'stopped': False,
         'size': 0,
     }
     
-    temp_path = output_path.with_suffix('.downloading')
+    temp_path = get_temp_path(output_path)
     resume_from = 0
     
     # Check for existing partial download to resume
     if temp_path.exists():
         resume_from = temp_path.stat().st_size
-    
+
+    response = None
     try:
         headers = {
             'Cookie': cookie,
@@ -136,6 +161,11 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
             result['auth_failed'] = True
             # Keep partial file for resume
             return result
+
+        if response.status_code == 404:
+            result['message'] = 'File not found (404)'
+            result['not_found'] = True
+            return result
         
         if 'accounts.google' in response.url:
             result['message'] = 'Auth failed - redirected to login'
@@ -146,16 +176,23 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
         if response.status_code == 416:
             if resume_from > 0:
                 # Verify with HEAD request
-                head_resp = requests.head(url, headers={'Cookie': cookie, 'User-Agent': headers['User-Agent']}, timeout=10)
-                if head_resp.status_code == 200:
-                    expected_size = int(head_resp.headers.get('content-length', 0))
-                    if expected_size > 0 and resume_from >= expected_size:
-                        temp_path.rename(output_path)
-                        size_history.record_size(filename, resume_from)
-                        result['success'] = True
-                        result['message'] = 'Resumed complete'
-                        result['size'] = resume_from
-                        return result
+                head_resp = requests.head(
+                    url,
+                    headers={'Cookie': cookie, 'User-Agent': headers['User-Agent']},
+                    timeout=10,
+                )
+                try:
+                    if head_resp.status_code == 200:
+                        expected_size = parse_content_length(head_resp.headers)
+                        if expected_size > 0 and resume_from >= expected_size:
+                            os.replace(temp_path, output_path)
+                            size_history.record_size(filename, resume_from)
+                            result['success'] = True
+                            result['message'] = 'Resumed complete'
+                            result['size'] = resume_from
+                            return result
+                finally:
+                    head_resp.close()
             temp_path.unlink(missing_ok=True)
             # Retry without resume (recursive call with fresh state)
             return download_file(url, output_path, file_index, cookie, size_history, extension)
@@ -169,7 +206,7 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
             return result
         
         # Get total size - for 206 Partial Content, content-length is remaining bytes
-        content_length = int(response.headers.get('content-length', 0))
+        content_length = parse_content_length(response.headers)
         
         if response.status_code == 206:
             total_size = resume_from + content_length
@@ -179,9 +216,8 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
                 # Server doesn't support resume, start fresh
                 resume_from = 0
         
-        if total_size < 1000 and resume_from == 0:
-            result['message'] = 'Auth failed - file too small'
-            result['auth_failed'] = True
+        if total_size < MIN_ARCHIVE_SIZE and resume_from == 0:
+            result['message'] = 'Response too small (not an archive)'
             return result
         
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -213,14 +249,18 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
         
         with open(temp_path, file_mode) as f:
             for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+                if download_state['should_stop']:
+                    result['message'] = 'Stopped'
+                    result['stopped'] = True
+                    return result
+
                 if chunk:
                     # Check first chunk for archive magic bytes (only on fresh downloads)
                     if downloaded == 0:
                         magic = get_magic_bytes(extension)
                         if magic and chunk[:len(magic)] != magic:
-                            temp_path.unlink()
-                            result['message'] = 'Auth failed - not a valid archive'
-                            result['auth_failed'] = True
+                            temp_path.unlink(missing_ok=True)
+                            result['message'] = 'Downloaded file is not a valid archive'
                             return result
                     
                     f.write(chunk)
@@ -248,8 +288,8 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
                         emit_status('stats_update', download_state['stats'])
                         last_emit_time = now
         
-        # Rename to final
-        temp_path.rename(output_path)
+        # Move into place (atomic, and works when the target exists on Windows)
+        os.replace(temp_path, output_path)
         size_history.record_size(filename, downloaded)
         
         result['success'] = True
@@ -258,162 +298,188 @@ def download_file(url: str, output_path: Path, file_index: int, cookie: str, siz
         return result
         
     except requests.exceptions.HTTPError as e:
-        if e.response and e.response.status_code == 404:
+        if e.response is not None and e.response.status_code == 404:
             result['message'] = 'File not found (404)'
-            return result
-        # Keep partial file for resume
-        result['message'] = f'HTTP error: {e}'
+            result['not_found'] = True
+        else:
+            # Keep partial file for resume
+            result['message'] = f'HTTP error: {e}'
         return result
     except requests.exceptions.RequestException as e:
         # Keep partial file for resume
         result['message'] = f'Network error: {e}'
         return result
+    except (OSError, ValueError) as e:
+        # Disk full, permission denied, malformed header, ...
+        result['message'] = f'Local error: {e}'
+        return result
+    finally:
+        if response is not None:
+            response.close()
 
 
 def run_downloads(cookie: str, url: str, output_dir: str, parallel: int, file_count: int):
     """Run the download process with parallel downloads."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    global download_state
-    
-    with state_lock:
-        download_state['is_running'] = True
-        download_state['should_stop'] = False
-        download_state['cookie'] = cookie
-        download_state['stats'] = {
-            'total_files': file_count,
-            'completed_files': 0,
-            'failed_files': 0,
-            'skipped_files': 0,
-            'bytes_downloaded': 0,
-            'start_time': datetime.now().isoformat(),
-        }
-        download_state['files'] = []
-        download_state['log'] = []
-    
-    add_log(f'Starting downloads (parallel: {parallel})...', 'info')
-    emit_status('download_started', {'message': 'Starting downloads...'})
-    
-    # Parse URL
-    base_url, file_num, extension, query_string = extract_url_parts(url)
-    
-    if base_url is None:
-        add_log('Invalid URL format', 'error')
-        emit_status('error', {'message': 'Invalid URL format'})
+
+    try:
         with state_lock:
-            download_state['is_running'] = False
-        return
-    
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    size_history = SizeHistory(output_dir)
-    
-    add_log(f'Output: {output_dir}', 'info')
-    add_log(f'URL pattern: {base_url}XXX{extension}', 'info')
-    
-    auth_failed = False
-    
-    while not auth_failed:
-        with state_lock:
-            if download_state['should_stop']:
-                break
-            current_cookie = download_state['cookie']
-        
+            download_state['should_stop'] = False
+            download_state['cookie'] = cookie
+            download_state['stats'] = {
+                'total_files': 0,
+                'completed_files': 0,
+                'failed_files': 0,
+                'skipped_files': 0,
+                'not_found_files': 0,
+                'bytes_downloaded': 0,
+                'start_time': datetime.now().isoformat(),
+            }
+            download_state['files'] = []
+            download_state['log'] = []
+
+        add_log(f'Starting downloads (parallel: {parallel})...', 'info')
+        emit_status('download_started', {'message': 'Starting downloads...'})
+
+        # Parse URL
+        base_url, file_num, extension, query_string = extract_url_parts(url)
+
+        if base_url is None:
+            add_log('Invalid URL format', 'error')
+            emit_status('error', {'message': 'Invalid URL format'})
+            return
+
+        output_path = Path(output_dir)
+        try:
+            output_path.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            message = f'Cannot create output directory {output_dir!r}: {e}'
+            add_log(message, 'error')
+            emit_status('error', {'message': message})
+            return
+
+        size_history = SizeHistory(output_dir)
+
+        add_log(f'Output: {output_dir}', 'info')
+        add_log(f'URL pattern: {base_url}XXX{extension}', 'info')
+
         # Build list of files to download
         to_download = []
+        skipped = 0
         for num in range(1, file_count + 1):
             filename = f"{base_url.split('/')[-1]}{num:03d}{extension}"
             filepath = output_path / filename
-            
+
             # Skip existing files
             if filepath.exists() and filepath.stat().st_size > 0:
                 expected = size_history.get_expected_size(filename)
                 if not expected or filepath.stat().st_size >= expected:
-                    with state_lock:
-                        download_state['stats']['skipped_files'] += 1
+                    skipped += 1
                     continue
-            
-            file_url = f"{base_url}{num:03d}{extension}"
-            if query_string:
-                query = query_string
-                # Update the 'i' parameter in query string if it exists (Google uses 0-based indexing)
-                if "&i=" in query or "?i=" in query:
-                    query = re.sub(r"[?&]i=\d+", f"&i={num - 1}", query)
-                    query = query.lstrip("&")
-                file_url += f"?{query}"
+
+            file_url = build_file_url(base_url, extension, query_string, num)
             to_download.append((num, file_url, filepath, filename))
-        
+
+        with state_lock:
+            download_state['stats']['skipped_files'] = skipped
+            download_state['stats']['total_files'] = len(to_download) + skipped
+            current_cookie = download_state['cookie']
+
         if not to_download:
             add_log('All files already downloaded!', 'success')
-            break
-        
+            emit_status('stats_update', download_state['stats'])
+            emit_status('download_complete', {
+                'message': 'All files already downloaded',
+                'stats': download_state['stats'],
+            })
+            return
+
         add_log(f'Downloading {len(to_download)} files...', 'info')
+        emit_status('download_info', {'total': len(to_download), 'skipped': skipped})
         emit_status('stats_update', download_state['stats'])
-        
+
+        auth_failed = False
+        stopped = False
+
         # Parallel downloads
         with ThreadPoolExecutor(max_workers=parallel) as executor:
             futures = {
-                executor.submit(download_file, url, path, idx, current_cookie, size_history, extension): (idx, name)
-                for idx, url, path, name in to_download
+                executor.submit(download_file, file_url, path, idx, current_cookie, size_history, extension): (idx, name)
+                for idx, file_url, path, name in to_download
             }
-            
+
             for future in as_completed(futures):
                 with state_lock:
                     if download_state['should_stop']:
-                        break
-                
+                        stopped = True
+
+                if stopped:
+                    for f in futures:
+                        f.cancel()
+                    break
+
                 idx, filename = futures[future]
-                
+
                 try:
                     result = future.result()
-                    
-                    if result['success']:
-                        add_log(f"✓ {filename} ({result['size']/(1024*1024):.1f} MB)", 'success')
-                        with state_lock:
-                            download_state['stats']['completed_files'] += 1
-                            
-                        update_file_state(idx, 'complete', 100)
-                    elif result['auth_failed']:
-                        add_log(f"✗ {filename}: {result['message']}", 'error')
-                        update_file_state(idx, 'failed')
-                        auth_failed = True
-                        # Cancel remaining futures
-                        for f in futures:
-                            f.cancel()
-                        break
-                        
-                    elif 'not found' in result['message'].lower() or '404' in result['message']:
-                        add_log(f"⊘ {filename}: not found", 'warning')
-                        update_file_state(idx, 'failed')
-                        
-                    else:
-                        add_log(f"✗ {filename}: {result['message']}", 'error')
-                        with state_lock:
-                            download_state['stats']['failed_files'] += 1
-                            
-                        update_file_state(idx, 'failed')
                 except Exception as e:
-                    add_log(f"✗ {filename}: {e}", 'error')
+                    result = {
+                        'index': idx, 'filename': filename, 'success': False,
+                        'message': str(e), 'auth_failed': False, 'not_found': False,
+                        'stopped': False, 'size': 0,
+                    }
+
+                if result['success']:
+                    add_log(f"✓ {filename} ({result['size']/(1024*1024):.1f} MB)", 'success')
+                    with state_lock:
+                        download_state['stats']['completed_files'] += 1
+                    update_file_state(idx, 'complete', 100)
+                elif result['stopped']:
+                    update_file_state(idx, 'pending')
+                elif result['auth_failed']:
+                    add_log(f"✗ {filename}: {result['message']}", 'error')
+                    update_file_state(idx, 'failed')
+                    auth_failed = True
+                    emit_status('file_complete', result)
+                    # Cancel remaining futures
+                    for f in futures:
+                        f.cancel()
+                    break
+                elif result['not_found']:
+                    add_log(f"⊘ {filename}: not found", 'warning')
+                    with state_lock:
+                        download_state['stats']['not_found_files'] += 1
+                    update_file_state(idx, 'not_found')
+                else:
+                    add_log(f"✗ {filename}: {result['message']}", 'error')
                     with state_lock:
                         download_state['stats']['failed_files'] += 1
                     update_file_state(idx, 'failed')
-                
+
+                emit_status('file_complete', result)
                 emit_status('stats_update', download_state['stats'])
-        
+
         if auth_failed:
             add_log('⚠️ Authentication needed - provide new cURL', 'warning')
             emit_status('auth_required', {'message': 'Auth expired. Provide new cURL.'})
-            with state_lock:
-                download_state['is_running'] = False
-            return
-        
-        # Done with this batch
-        break
-    
-    with state_lock:
-        stats = download_state['stats']
-        add_log(f"🎉 Done! {stats['completed_files']} completed, {stats['skipped_files']} skipped, {stats['failed_files']} failed", 'success')
-        emit_status('download_complete', {'message': 'Done!', 'stats': stats})
-        download_state['is_running'] = False
+        elif stopped:
+            add_log('⏹ Download stopped', 'warning')
+            emit_status('download_stopped', {'message': 'Download stopped'})
+        else:
+            stats = download_state['stats']
+            add_log(
+                f"🎉 Done! {stats['completed_files']} completed, {stats['skipped_files']} skipped, "
+                f"{stats['not_found_files']} missing, {stats['failed_files']} failed",
+                'success',
+            )
+            emit_status('download_complete', {'message': 'Done!', 'stats': stats})
+    except Exception as e:
+        # Never leave the UI stuck in "running" if something unexpected blows up.
+        add_log(f'Unexpected error: {e}', 'error')
+        emit_status('error', {'message': f'Unexpected error: {e}'})
+    finally:
+        with state_lock:
+            download_state['is_running'] = False
 
 # ============================================================================
 # WEB ROUTES
@@ -654,6 +720,8 @@ HTML_TEMPLATE = '''
         .file-status.downloading { background: var(--accent); color: white; }
         .file-status.complete { background: var(--success); color: white; }
         .file-status.failed { background: var(--error); color: white; }
+        .file-status.not_found { background: var(--bg-light); color: var(--warning); }
+        .file-status.stopped { background: var(--bg-light); color: var(--text-dim); }
         
         .progress-bar {
             width: 100%;
@@ -734,7 +802,7 @@ HTML_TEMPLATE = '''
                 </div>
                 <div class="form-group">
                     <label for="parallel">Parallel Downloads</label>
-                    <input type="number" id="parallel" value="{{ parallel }}" min="1" max="10">
+                    <input type="number" id="parallel" value="{{ parallel }}" min="1" max="20">
                 </div>
                 <div class="form-group">
                     <label for="file-count">Parts</label>
@@ -744,6 +812,9 @@ HTML_TEMPLATE = '''
             
             <button class="btn-primary" id="start-btn" onclick="startDownload()">
                 🚀 Start Download
+            </button>
+            <button class="btn-danger" id="stop-btn" onclick="stopDownload()" disabled>
+                ⏹ Stop
             </button>
         </div>
         
@@ -767,6 +838,10 @@ HTML_TEMPLATE = '''
                 <div class="stat-box warning">
                     <div class="stat-value" id="stat-skipped">0</div>
                     <div class="stat-label">Skipped</div>
+                </div>
+                <div class="stat-box warning">
+                    <div class="stat-value" id="stat-not-found">0</div>
+                    <div class="stat-label">Not Found</div>
                 </div>
                 <div class="stat-box">
                     <div class="stat-value" id="stat-size">0 GB</div>
@@ -816,7 +891,11 @@ HTML_TEMPLATE = '''
         
         function showAlert(message, type = 'error') {
             const container = document.getElementById('alert-container');
-            container.innerHTML = `<div class="alert alert-${type}">${message}</div>`;
+            container.innerHTML = '';
+            const alertEl = document.createElement('div');
+            alertEl.className = `alert alert-${type}`;
+            alertEl.textContent = message;
+            container.appendChild(alertEl);
             setTimeout(() => container.innerHTML = '', 5000);
         }
         
@@ -840,6 +919,7 @@ HTML_TEMPLATE = '''
             }
             
             document.getElementById('start-btn').disabled = true;
+            document.getElementById('stop-btn').disabled = false;
             document.getElementById('progress-card').classList.remove('hidden');
             document.getElementById('files-card').classList.remove('hidden');
             
@@ -864,12 +944,28 @@ HTML_TEMPLATE = '''
                 if (data.error) {
                     showAlert(data.error);
                     document.getElementById('start-btn').disabled = false;
+                    document.getElementById('stop-btn').disabled = true;
                 }
             })
             .catch(err => {
                 showAlert('Failed to start download: ' + err);
                 document.getElementById('start-btn').disabled = false;
+                document.getElementById('stop-btn').disabled = true;
             });
+        }
+
+        function stopDownload() {
+            document.getElementById('stop-btn').disabled = true;
+            log('Stopping download...', 'warning');
+            fetch('/api/stop', { method: 'POST' })
+                .then(res => res.json())
+                .then(data => {
+                    if (data.error) {
+                        showAlert(data.error);
+                        document.getElementById('stop-btn').disabled = false;
+                    }
+                })
+                .catch(err => showAlert('Failed to stop download: ' + err));
         }
         
         // Socket event handlers
@@ -884,19 +980,22 @@ HTML_TEMPLATE = '''
                 document.getElementById('files-card').classList.remove('hidden');
                 document.getElementById('start-btn').disabled = state.is_running;
             }
+            document.getElementById('stop-btn').disabled = !state.is_running;
             
             // Restore stats
             document.getElementById('stat-total').textContent = state.stats.total_files;
             document.getElementById('stat-complete').textContent = state.stats.completed_files;
             document.getElementById('stat-failed').textContent = state.stats.failed_files;
             document.getElementById('stat-skipped').textContent = state.stats.skipped_files;
+            document.getElementById('stat-not-found').textContent = state.stats.not_found_files || 0;
             document.getElementById('stat-size').textContent = formatBytes(state.stats.bytes_downloaded);
             lastBytesDownloaded = state.stats.bytes_downloaded;
             lastSpeedUpdate = Date.now();
             
-            // Update progress bar (include skipped in progress)
+            // Update progress bar (every processed file counts)
             const total = state.stats.total_files || 1;
-            const completed = state.stats.completed_files + state.stats.failed_files + state.stats.skipped_files;
+            const completed = state.stats.completed_files + state.stats.failed_files
+                + state.stats.skipped_files + (state.stats.not_found_files || 0);
             const percent = Math.min((completed / total) * 100, 100);
             document.getElementById('overall-progress').style.width = percent + '%';
             
@@ -941,7 +1040,7 @@ HTML_TEMPLATE = '''
         });
         
         socket.on('download_info', (data) => {
-            document.getElementById('stat-total').textContent = data.total;
+            document.getElementById('stat-total').textContent = data.total + data.skipped;
             document.getElementById('stat-skipped').textContent = data.skipped;
             log(`Found ${data.total} files to download (${data.skipped} skipped)`, 'info');
         });
@@ -956,11 +1055,14 @@ HTML_TEMPLATE = '''
         });
         
         socket.on('file_complete', (data) => {
+            // The server already logs the outcome; only update the row here.
             if (data.success) {
-                log(`✓ ${data.filename} complete (${formatBytes(data.size)})`, 'success');
                 updateFileStatus(data.index, data.filename, 'complete');
+            } else if (data.not_found) {
+                updateFileStatus(data.index, data.filename, 'not_found');
+            } else if (data.stopped) {
+                updateFileStatus(data.index, data.filename, 'stopped');
             } else {
-                log(`✗ ${data.filename}: ${data.message}`, 'error');
                 updateFileStatus(data.index, data.filename, 'failed');
             }
         });
@@ -970,6 +1072,7 @@ HTML_TEMPLATE = '''
             document.getElementById('stat-total').textContent = stats.total_files;
             document.getElementById('stat-failed').textContent = stats.failed_files;
             document.getElementById('stat-skipped').textContent = stats.skipped_files;
+            document.getElementById('stat-not-found').textContent = stats.not_found_files || 0;
             document.getElementById('stat-size').textContent = formatBytes(stats.bytes_downloaded);
             
             // Calculate speed - update every 0.5 seconds for faster feedback
@@ -987,8 +1090,9 @@ HTML_TEMPLATE = '''
             
             // Update progress bar
             const total = parseInt(document.getElementById('stat-total').textContent) || 1;
-            const completed = stats.completed_files + stats.failed_files + stats.skipped_files;
-            const percent = (completed / total) * 100;
+            const completed = stats.completed_files + stats.failed_files + stats.skipped_files
+                + (stats.not_found_files || 0);
+            const percent = Math.min((completed / total) * 100, 100);
             document.getElementById('overall-progress').style.width = percent + '%';
         });
         
@@ -996,18 +1100,28 @@ HTML_TEMPLATE = '''
             log('⚠️ ' + data.message, 'warning');
             showAlert(data.message + ' Please update the cookie and restart.', 'error');
             document.getElementById('start-btn').disabled = false;
+            document.getElementById('stop-btn').disabled = true;
+        });
+
+        socket.on('download_stopped', (data) => {
+            log('⏹ ' + data.message, 'warning');
+            showAlert(data.message, 'success');
+            document.getElementById('start-btn').disabled = false;
+            document.getElementById('stop-btn').disabled = true;
         });
         
         socket.on('download_complete', (data) => {
             log('🎉 ' + data.message, 'success');
             showAlert(data.message, 'success');
             document.getElementById('start-btn').disabled = false;
+            document.getElementById('stop-btn').disabled = true;
         });
         
         socket.on('error', (data) => {
             log('Error: ' + data.message, 'error');
             showAlert(data.message);
             document.getElementById('start-btn').disabled = false;
+            document.getElementById('stop-btn').disabled = true;
         });
         
         function updateFileStatus(index, filename, status) {
@@ -1018,10 +1132,17 @@ HTML_TEMPLATE = '''
                 item = document.createElement('div');
                 item.id = `file-${index}`;
                 item.className = 'file-item';
-                item.innerHTML = `
-                    <span class="file-name">${filename}</span>
-                    <span class="file-status ${status}">${status}</span>
-                `;
+
+                const nameEl = document.createElement('span');
+                nameEl.className = 'file-name';
+                nameEl.textContent = filename;
+
+                const statusEl = document.createElement('span');
+                statusEl.className = `file-status ${status}`;
+                statusEl.textContent = status;
+
+                item.appendChild(nameEl);
+                item.appendChild(statusEl);
                 list.appendChild(item);
             } else {
                 item.querySelector('.file-status').className = `file-status ${status}`;
@@ -1065,40 +1186,57 @@ def index():
 
 @app.route('/api/start', methods=['POST'])
 def api_start():
-    data = request.json
-    
+    data = request.get_json(silent=True) or {}
+
+    # Claim the running flag atomically so two requests cannot both start.
     with state_lock:
         if download_state['is_running']:
             return jsonify({'error': 'Download already in progress'})
-    
-    curl_input = data.get('curl_input', '')
-    url = data.get('url', '')
-    output_dir = data.get('output_dir', DEFAULT_OUTPUT_DIR)
-    parallel = data.get('parallel', DEFAULT_PARALLEL)
-    file_count = data.get('file_count', DEFAULT_FILE_COUNT)
-    
-    # Extract cookie from cURL
-    cookie = extract_cookie_from_curl(curl_input) if curl_input else ''
-    
-    if not cookie:
-        return jsonify({'error': 'Could not extract cookie from input'})
-    
-    # Try to extract URL from cURL if not provided
-    if not url and curl_input:
-        url = extract_url_from_curl(curl_input)
-    
-    if not url:
-        return jsonify({'error': 'No download URL provided'})
-    
-    # Start download in background thread
-    thread = threading.Thread(
-        target=run_downloads,
-        args=(cookie, url, output_dir, parallel, file_count),
-        daemon=True
-    )
-    thread.start()
-    
-    return jsonify({'status': 'started'})
+        download_state['is_running'] = True
+
+    try:
+        curl_input = data.get('curl_input') or ''
+        url = data.get('url') or ''
+        output_dir = data.get('output_dir') or DEFAULT_OUTPUT_DIR
+        parallel = _clamp_int(data.get('parallel'), DEFAULT_PARALLEL, 1, MAX_PARALLEL)
+        file_count = _clamp_int(data.get('file_count'), DEFAULT_FILE_COUNT, 1, MAX_FILE_COUNT)
+
+        # Extract cookie from cURL
+        cookie = extract_cookie_from_curl(curl_input) if curl_input else ''
+
+        if not cookie:
+            raise ValueError('Could not extract cookie from input')
+
+        # Try to extract URL from cURL if not provided
+        if not url and curl_input:
+            url = extract_url_from_curl(curl_input)
+
+        if not url:
+            raise ValueError('No download URL provided')
+
+        # Start download in background thread
+        thread = threading.Thread(
+            target=run_downloads,
+            args=(cookie, url, output_dir, parallel, file_count),
+            daemon=True
+        )
+        thread.start()
+
+        return jsonify({'status': 'started'})
+    except Exception as e:
+        with state_lock:
+            download_state['is_running'] = False
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/api/stop', methods=['POST'])
+def api_stop():
+    """Ask the running download worker to stop after the current chunks."""
+    with state_lock:
+        if not download_state['is_running']:
+            return jsonify({'error': 'No download in progress'}), 409
+        download_state['should_stop'] = True
+    add_log('⏹ Stop requested - finishing current chunks...', 'warning')
+    return jsonify({'status': 'stopping'})
 
 @app.route('/api/status')
 def api_status():
@@ -1152,17 +1290,19 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='Google Takeout Downloader - Web Interface')
-    parser.add_argument('--host', default='0.0.0.0', help='Host to bind to (default: 0.0.0.0)')
+    parser.add_argument('--host', default='127.0.0.1',
+                        help='Host to bind to (default: 127.0.0.1; use 0.0.0.0 for LAN access)')
     parser.add_argument('--port', type=int, default=5000, help='Port to bind to (default: 5000)')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     
     args = parser.parse_args()
+    display_host = 'localhost' if args.host in ('0.0.0.0', '::') else args.host
     
     print(f"""
 ╔══════════════════════════════════════════════════════════════╗
 ║         Google Takeout Downloader - Web Interface            ║
 ╠══════════════════════════════════════════════════════════════╣
-║  Open your browser to: http://{args.host}:{args.port:<5}                    ║
+║  Open your browser to: http://{display_host}:{args.port:<5}                    ║
 ║  Press Ctrl+C to stop                                        ║
 ╚══════════════════════════════════════════════════════════════╝
 """)

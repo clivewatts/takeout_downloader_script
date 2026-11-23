@@ -10,7 +10,6 @@ Usage:
     python dedupe_takeout.py /path/to/takeout/folder --dry-run  # Preview only
 """
 
-import os
 import sys
 from pathlib import Path
 from collections import defaultdict
@@ -27,8 +26,10 @@ def get_file_signature(filepath):
         # Read first chunk
         first_chunk = f.read(SAMPLE_SIZE)
         
-        # Read last chunk (if file is big enough)
-        if size > SAMPLE_SIZE * 2:
+        # Read last chunk (if the file has more than one sample worth of data).
+        # The old `> SAMPLE_SIZE * 2` test skipped the tail for files between
+        # 64KB and 128KB, so two different files could compare equal.
+        if size > SAMPLE_SIZE:
             f.seek(-SAMPLE_SIZE, 2)  # Seek from end
             last_chunk = f.read(SAMPLE_SIZE)
         else:
@@ -61,7 +62,10 @@ def signatures_match(sig1, sig2):
 def find_duplicates(folder):
     """Find all archive files and group potential duplicates by size first."""
     # Get all archive files sorted by name (so lower numbers come first)
-    zip_files = sorted(list(folder.glob("*.zip")) + list(folder.glob("*.tgz")))
+    archive_files = set()
+    for pattern in ("*.zip", "*.tgz", "*.tar.gz"):
+        archive_files.update(folder.glob(pattern))
+    zip_files = sorted(archive_files)
     
     if not zip_files:
         print(f"No archive files found in {folder}")

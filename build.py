@@ -8,13 +8,19 @@ Usage:
     python build.py --help       # Show instructions
 """
 
+import importlib.util
+import platform
 import subprocess
 import sys
-import platform
 from pathlib import Path
 
 APP_NAME = "takeout"
-APP_VERSION = "4.0.0"
+
+# Single source of truth for the version lives in takeout.py.
+try:
+    from takeout import VERSION as APP_VERSION
+except Exception:
+    APP_VERSION = "4.3.0"
 
 
 def get_platform():
@@ -27,13 +33,12 @@ def get_platform():
 
 def install_pyinstaller():
     """Install PyInstaller if not present."""
-    try:
-        import PyInstaller
+    if importlib.util.find_spec("PyInstaller") is not None:
         print("✓ PyInstaller is installed")
-    except ImportError:
-        print("Installing PyInstaller...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "pyinstaller"], check=True)
-        print("✓ PyInstaller installed")
+        return
+    print("Installing PyInstaller...")
+    subprocess.run([sys.executable, "-m", "pip", "install", "pyinstaller"], check=True)
+    print("✓ PyInstaller installed")
 
 
 def build():
@@ -86,7 +91,7 @@ def build():
         if icon_path.exists():
             cmd.extend(["--icon", str(icon_path)])
     
-    print(f"Running PyInstaller...\n")
+    print("Running PyInstaller...\n")
     result = subprocess.run(cmd)
     
     if result.returncode == 0:
@@ -100,7 +105,7 @@ def build():
         output_file = dist_path / exe_name
         
         print(f"\n{'='*60}")
-        print(f"✓ BUILD SUCCESSFUL!")
+        print("✓ BUILD SUCCESSFUL!")
         print(f"{'='*60}")
         print(f"\nExecutable: {output_file}")
         
@@ -117,7 +122,7 @@ Usage:
 """)
         return True
     else:
-        print(f"\n✗ Build failed!")
+        print("\n✗ Build failed!")
         return False
 
 
