@@ -467,3 +467,77 @@ def test_api_stop_requires_a_running_download(monkeypatch):
     assert response.status_code == 200
     assert web.download_state['should_stop'] is True
     _reset_web_state()
+
+
+def test_web_stop_and_restart_resumes_both_parts(tmp_path, monkeypatch):
+    import google_takeout_web as web
+
+    _reset_web_state()
+    client = web.app.test_client()
+    both_started = threading.Barrier(3)
+    release_workers = threading.Event()
+    stopped = threading.Event()
+    finished = threading.Event()
+    requests_seen = []
+    starts = {}
+    split = len(SAMPLE_ZIP) // 2
+
+    def emit(event, data):
+        if event == 'file_start':
+            starts[data['index']] = data['resumed_from']
+        elif event == 'download_stopped':
+            stopped.set()
+        elif event == 'download_complete':
+            finished.set()
+
+    def get(url, headers, **kwargs):
+        part = int(urlparse(url).path[-7:-4])
+        offset = split if headers.get('Range') == f'bytes={split}-' else 0
+        requests_seen.append((part, headers.get('Range')))
+        response = requests.Response()
+        response.url = url
+        response.status_code = 206 if offset else 200
+        response.headers['Content-Length'] = str(len(SAMPLE_ZIP) - offset)
+        if offset:
+            response.headers['Content-Range'] = f'bytes {offset}-{len(SAMPLE_ZIP) - 1}/{len(SAMPLE_ZIP)}'
+        response.close = Mock()
+
+        def chunks(chunk_size):
+            if not stopped.is_set():
+                yield SAMPLE_ZIP[:split]
+                both_started.wait(timeout=5)
+                assert release_workers.wait(timeout=5)
+                yield SAMPLE_ZIP[split:]
+            else:
+                yield SAMPLE_ZIP[offset:]
+
+        response.iter_content = chunks
+        return response
+
+    monkeypatch.setattr(web.socketio, 'emit', emit)
+    monkeypatch.setattr(requests, 'get', get)
+    url = f'https://takeout.google.com{PART_PREFIX}001.zip'
+    payload = {
+        'curl_input': f"curl '{url}' -b 'SID=test'",
+        'output_dir': str(tmp_path),
+        'parallel': 2,
+        'file_count': 3,
+    }
+    assert client.post('/api/start', json=payload).json == {'status': 'started'}
+    try:
+        both_started.wait(timeout=5)
+        assert client.post('/api/stop').json == {'status': 'stopping'}
+    finally:
+        release_workers.set()
+    assert stopped.wait(timeout=5)
+    assert sorted(requests_seen) == [(1, None), (2, None)]
+    assert {entry['status'] for entry in client.get('/api/status').json['files']} == {'stopped'}
+
+    requests_seen.clear()
+    starts.clear()
+    assert client.post('/api/start', json=payload).json == {'status': 'started'}
+    assert finished.wait(timeout=5)
+    assert sorted(requests_seen) == [(1, f'bytes={split}-'), (2, f'bytes={split}-'), (3, None)]
+    assert starts == {1: split, 2: split, 3: 0}
+    for part in range(1, 4):
+        assert (tmp_path / f'{PART_PREFIX[1:]}{part:03d}.zip').read_bytes() == SAMPLE_ZIP
