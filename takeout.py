@@ -20,13 +20,13 @@ import os
 import re
 import sys
 import json
-import time
 import threading
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple, Callable
+from typing import Optional, Dict, Tuple, Callable
 from datetime import datetime
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import parse_qsl, urlencode
 
 import requests
 
@@ -41,6 +41,11 @@ MAX_PARALLEL = 20
 DEFAULT_FILE_COUNT = 100
 DEFAULT_OUTPUT_DIR = "./downloads"
 SIZE_HISTORY_FILE = ".takeout_sizes.json"
+MAX_FILE_COUNT = 500
+TEMP_FILE_SUFFIX = ".downloading"
+
+# Anything smaller than this is treated as an error page rather than an archive.
+MIN_ARCHIVE_SIZE = 1000
 
 # Magic bytes for validating downloaded archive formats
 ARCHIVE_MAGIC = {
@@ -49,10 +54,53 @@ ARCHIVE_MAGIC = {
     '.tar.gz': b'\x1f\x8b',
 }
 
+# Archive extensions Google Takeout uses, longest first so ".tar.gz" wins.
+ARCHIVE_EXTENSIONS = ('.tar.gz', '.tgz', '.zip')
+_ARCHIVE_EXT_RE = '|'.join(re.escape(ext) for ext in ARCHIVE_EXTENSIONS)
+
 
 def get_magic_bytes(extension: str) -> Optional[bytes]:
     """Get expected magic bytes for a file extension. Returns None if unknown."""
     return ARCHIVE_MAGIC.get(extension.lower())
+
+
+def get_temp_path(filepath: Path) -> Path:
+    """Path of the in-progress file for a download.
+
+    Kept as `with_suffix()` so existing `.downloading` partials still resume.
+    """
+    return filepath.with_suffix(TEMP_FILE_SUFFIX)
+
+
+def parse_content_length(headers) -> int:
+    """Read Content-Length as an int, tolerating a missing/invalid header."""
+    try:
+        return int(headers.get('content-length', 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def get_range_total(headers, offset: int) -> int:
+    """Return the archive size for a response covering the requested tail."""
+    match = re.fullmatch(r'bytes ([0-9]+)-([0-9]+)/([0-9]+)', headers.get('content-range', ''))
+    if not match or headers.get('content-encoding', 'identity').lower() != 'identity':
+        raise ValueError("Invalid partial response")
+
+    start, end, total = map(int, match.groups())
+    if not (start == offset <= end == total - 1):
+        raise ValueError("Content-Range does not match the requested archive tail")
+    if 'content-length' in headers and parse_content_length(headers) != total - offset:
+        raise ValueError("Content-Length does not match Content-Range")
+    return total
+
+
+def partial_matches_size(path: Path, size: int, expected: int, extension: str) -> bool:
+    """Check the size and archive signature before publishing a partial file."""
+    if size != expected or expected < MIN_ARCHIVE_SIZE:
+        return False
+    magic = get_magic_bytes(extension)
+    with path.open('rb') as file:
+        return not magic or file.read(len(magic)) == magic
 
 # =============================================================================
 # DATA CLASSES  
@@ -65,6 +113,7 @@ class DownloadStats:
     completed_files: int = 0
     failed_files: int = 0
     skipped_files: int = 0
+    not_found_files: int = 0
     bytes_downloaded: int = 0
     start_time: Optional[datetime] = None
 
@@ -74,36 +123,49 @@ class DownloadStats:
 # =============================================================================
 
 class SizeHistory:
-    """Track known file sizes to detect incomplete downloads."""
-    
+    """Track known file sizes to detect incomplete downloads.
+
+    Downloads run in parallel, so writes are serialized and made atomic:
+    a concurrent `json.dump` used to be able to leave a truncated file behind.
+    """
+
     def __init__(self, output_dir: str):
         self.path = Path(output_dir) / SIZE_HISTORY_FILE
         self.sizes: Dict[str, int] = {}
+        self._lock = threading.RLock()
         self.load()
-    
+
     def load(self):
         """Load size history from file."""
-        if self.path.exists():
-            try:
-                with open(self.path) as f:
-                    self.sizes = json.load(f)
-            except:
-                self.sizes = {}
-    
+        if not self.path.exists():
+            return
+        try:
+            with open(self.path) as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self.sizes = data
+        except (OSError, ValueError) as e:
+            print(f"  Warning: could not read {self.path.name}: {e}")
+            self.sizes = {}
+
     def save(self):
-        """Save size history to file."""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.path, 'w') as f:
-            json.dump(self.sizes, f, indent=2)
-    
+        """Atomically save size history to file (caller may hold the lock)."""
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self.path.with_name(self.path.name + '.tmp')
+            with open(tmp_path, 'w') as f:
+                json.dump(self.sizes, f, indent=2)
+            os.replace(tmp_path, self.path)
+
     def get_expected_size(self, filename: str) -> Optional[int]:
         """Get expected size for a file, if known."""
         return self.sizes.get(filename)
-    
+
     def record_size(self, filename: str, size: int):
         """Record a successful download size."""
-        self.sizes[filename] = size
-        self.save()
+        with self._lock:
+            self.sizes[filename] = size
+            self.save()
 
 
 # =============================================================================
@@ -123,22 +185,39 @@ def extract_url_parts(url: str) -> Tuple[Optional[str], Optional[int], Optional[
     else:
         url_path, query_string = url, ''
     
-    # Match pattern: takeout-TIMESTAMP-BATCH-FILENUM.zip
+    # Match pattern: takeout-TIMESTAMP-BATCH-FILENUM.tar.gz
     # Example: takeout-20251207T071725Z-3-003.zip
     #          base = everything up to and including "3-"
     #          file_num = 003
-    match = re.search(r'(.*takeout-\d{8}T\d{6}Z-\d+-)(\d{3})(\.\w+)$', url_path)
+    match = re.search(rf'(.*takeout-\d{{8}}T\d{{6}}Z-\d+-)(\d{{3}})({_ARCHIVE_EXT_RE})$',
+                      url_path, re.IGNORECASE)
     if not match:
         # Try alternate pattern without timestamp
-        match = re.search(r'(.*takeout-[^-]+-\d+-)(\d{3})(\.\w+)$', url_path)
+        match = re.search(rf'(.*takeout-[^-]+-\d+-)(\d{{3}})({_ARCHIVE_EXT_RE})$',
+                          url_path, re.IGNORECASE)
         if not match:
             return None, None, None, ''
-    
+
     base = match.group(1)
     file_num = int(match.group(2))
-    ext = match.group(3)
-    
+    ext = match.group(3).lower()
+
     return base, file_num, ext, query_string
+
+
+def build_file_url(base: str, extension: str, query_string: str, num: int) -> str:
+    """Build the download URL for a part, updating the `i` index parameter.
+
+    Google's URL carries the 0-based part index as `i`. It must be parsed
+    properly: a plain regex misses it when it is the first query parameter.
+    """
+    url = f"{base}{num:03d}{extension}"
+    if not query_string:
+        return url
+
+    params = parse_qsl(query_string, keep_blank_values=True)
+    params = [(key, str(num - 1) if key == 'i' else value) for key, value in params]
+    return f"{url}?{urlencode(params)}"
 
 
 def extract_cookies_from_powershell(ps_text: str) -> str:
@@ -198,8 +277,8 @@ def extract_cookie_from_curl(curl_text: str) -> str:
         return extract_cookies_from_powershell(curl_text)
     
     # Try to find Cookie header in cURL command
-    # -H 'Cookie: ...'
-    match = re.search(r"-H\s+['\"]Cookie:\s*([^'\"]+)['\"]", curl_text, re.IGNORECASE)
+    # -H 'Cookie: ...' (Chrome/Edge) or --header 'Cookie: ...' (Firefox)
+    match = re.search(r"(?:-H|--header)\s+['\"]Cookie:\s*([^'\"]+)['\"]", curl_text, re.IGNORECASE)
     if match:
         cookie = match.group(1).strip()
         # Remove escaped backslashes if present
@@ -267,7 +346,8 @@ class TakeoutDownloader:
     4. Cleans up bad zips and resumes from last good
     """
     
-    def __init__(self, output_dir: str = DEFAULT_OUTPUT_DIR, parallel: int = DEFAULT_PARALLEL):
+    def __init__(self, output_dir: str = DEFAULT_OUTPUT_DIR, parallel: int = DEFAULT_PARALLEL,
+                 log_fn: Optional[Callable[[str], None]] = None):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.size_history = SizeHistory(output_dir)
@@ -281,33 +361,41 @@ class TakeoutDownloader:
         self.auth_failed = False  # Flag for parallel downloads
         self.stats = DownloadStats()
         self._lock = threading.Lock()  # For thread-safe stats updates
-    
+        self.log_fn = log_fn or print
+
+    def _log(self, message: str):
+        """Emit a log line through the configured sink (print for the CLI)."""
+        try:
+            self.log_fn(message)
+        except Exception:
+            pass
+
     def set_curl(self, curl_text: str) -> bool:
         """Set cookie and URL from cURL command."""
         # Extract cookie
         self.cookie = extract_cookie_from_curl(curl_text)
         if not self.cookie:
-            print("✗ Could not extract cookie from cURL")
+            self._log("✗ Could not extract cookie from cURL")
             return False
         
         # Extract URL
         url = extract_url_from_curl(curl_text)
         if not url:
-            print("✗ Could not extract URL from cURL")
+            self._log("✗ Could not extract URL from cURL")
             return False
         
         # Parse URL parts
         base, file_num, ext, query = extract_url_parts(url)
         if not base:
-            print("✗ Could not parse URL pattern")
+            self._log("✗ Could not parse URL pattern")
             return False
         
         self.base_url = base
         self.extension = ext
         self.query_string = query
         
-        print(f"✓ Cookie: {len(self.cookie)} chars")
-        print(f"✓ URL pattern: {base}XXX{ext}")
+        self._log(f"✓ Cookie: {len(self.cookie)} chars")
+        self._log(f"✓ URL pattern: {base}XXX{ext}")
         return True
     
     def get_filename(self, num: int) -> str:
@@ -316,15 +404,7 @@ class TakeoutDownloader:
     
     def get_url(self, num: int) -> str:
         """Get URL for file number."""
-        url = f"{self.base_url}{num:03d}{self.extension}"
-        if self.query_string:
-            query = self.query_string
-            # Update the 'i' parameter in query string if it exists (Google uses 0-based indexing)
-            if "&i=" in query or "?i=" in query:
-                query = re.sub(r"[?&]i=\d+", f"&i={num - 1}", query)
-                query = query.lstrip("&")
-            url += f"?{query}"
-        return url
+        return build_file_url(self.base_url, self.extension, self.query_string, num)
     
     def get_filepath(self, num: int) -> Path:
         """Get local file path for file number."""
@@ -341,19 +421,19 @@ class TakeoutDownloader:
         
         for num in range(1, self.file_count + 1):
             filepath = self.get_filepath(num)
-            temp_path = filepath.with_suffix('.downloading')
+            temp_path = get_temp_path(filepath)
             
             # Check if there's a partial download to resume
             if temp_path.exists():
                 partial_size = temp_path.stat().st_size
                 if partial_size > 0:
-                    print(f"  Found partial: {filepath.name} ({partial_size/(1024*1024):.1f}MB to resume)")
+                    self._log(f"  Found partial: {filepath.name} ({partial_size/(1024*1024):.1f}MB to resume)")
                     if first_missing is None:
                         first_missing = num
                     continue
                 else:
                     # Zero-sized partial, delete it
-                    temp_path.unlink()
+                    temp_path.unlink(missing_ok=True)
             
             if not filepath.exists():
                 if first_missing is None:
@@ -364,8 +444,8 @@ class TakeoutDownloader:
             
             # Zero-sized = definitely bad
             if size == 0:
-                print(f"  Deleting zero-sized: {filepath.name}")
-                filepath.unlink()
+                self._log(f"  Deleting zero-sized: {filepath.name}")
+                filepath.unlink(missing_ok=True)
                 if first_missing is None:
                     first_missing = num
                 continue
@@ -373,8 +453,8 @@ class TakeoutDownloader:
             # Check against known size
             expected = self.size_history.get_expected_size(filepath.name)
             if expected and size < expected:
-                print(f"  Deleting incomplete: {filepath.name} ({size} < {expected})")
-                filepath.unlink()
+                self._log(f"  Deleting incomplete: {filepath.name} ({size} < {expected})")
+                filepath.unlink(missing_ok=True)
                 if first_missing is None:
                     first_missing = num
                 continue
@@ -405,18 +485,20 @@ class TakeoutDownloader:
             if size > 0 and (not expected or size >= expected):
                 return True, "already exists"
         
-        temp_path = filepath.with_suffix('.downloading')
+        temp_path = get_temp_path(filepath)
         resume_from = 0
         
         # Check for existing partial download to resume
         if temp_path.exists():
             resume_from = temp_path.stat().st_size
             if resume_from > 0:
-                print(f"  [{filepath.name}] Resuming from {resume_from/(1024*1024):.1f}MB")
-        
+                self._log(f"  [{filepath.name}] Resuming from {resume_from/(1024*1024):.1f}MB")
+
+        response = None
         try:
             headers = {
                 'Cookie': self.cookie,
+                'Accept-Encoding': 'identity',
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             }
             
@@ -437,24 +519,30 @@ class TakeoutDownloader:
                 return False, "AUTH_FAILED"
             
             # Check for redirect to login
-            if response.status_code == 302 or 'accounts.google' in response.url:
+            if 'accounts.google' in response.url:
                 return False, "AUTH_FAILED"
             
             # 416 = Range Not Satisfiable (file might be complete or server doesn't support range)
-            if response.status_code == 416:
-                # Try without range header - file might be complete
-                if resume_from > 0:
-                    print(f"  [{filepath.name}] Range not satisfiable, checking if complete...")
-                    # Verify with a fresh request to get content-length
-                    head_resp = requests.head(url, headers={'Cookie': self.cookie, 'User-Agent': headers['User-Agent']}, timeout=10)
+            if response.status_code == 416 and resume_from > 0:
+                self._log(f"  [{filepath.name}] Range not satisfiable, checking if complete...")
+                # Verify with a fresh request to get content-length
+                head_resp = requests.head(
+                    url,
+                    headers={'Cookie': self.cookie, 'User-Agent': headers['User-Agent'], 'Accept-Encoding': 'identity'},
+                    timeout=10,
+                )
+                try:
                     if head_resp.status_code == 200:
-                        expected_size = int(head_resp.headers.get('content-length', 0))
-                        if expected_size > 0 and resume_from >= expected_size:
-                            # File is complete, rename it
-                            temp_path.rename(filepath)
+                        expected_size = parse_content_length(head_resp.headers)
+                        if partial_matches_size(temp_path, resume_from, expected_size, self.extension):
+                            # File is complete, move it into place
+                            os.replace(temp_path, filepath)
                             self.size_history.record_size(filepath.name, resume_from)
                             return True, "resumed-complete"
+                finally:
+                    head_resp.close()
                 # Otherwise restart from scratch
+                response.close()
                 temp_path.unlink(missing_ok=True)
                 return self.download_file(num)  # Retry without resume
             
@@ -465,22 +553,20 @@ class TakeoutDownloader:
             if 'text/html' in content_type:
                 return False, "AUTH_FAILED"
             
-            # Get total size - for 206 Partial Content, content-length is remaining bytes
-            content_length = int(response.headers.get('content-length', 0))
+            # Use Content-Range to verify the archive size on partial responses.
+            content_length = parse_content_length(response.headers)
             
-            # For resumed downloads (206), total = resume_from + content_length
-            # For fresh downloads (200), total = content_length
             if response.status_code == 206:
-                total_size = resume_from + content_length
+                total_size = get_range_total(response.headers, resume_from)
             else:
                 total_size = content_length
                 # Fresh download - reset resume_from
                 if resume_from > 0:
-                    print(f"  [{filepath.name}] Server doesn't support resume, starting fresh")
+                    self._log(f"  [{filepath.name}] Server doesn't support resume, starting fresh")
                     resume_from = 0
             
-            if total_size < 1000 and resume_from == 0:
-                return False, "AUTH_FAILED"  # Too small, probably auth page
+            if total_size < MIN_ARCHIVE_SIZE and resume_from == 0:
+                return False, "EMPTY_RESPONSE"
             
             # Open file in append mode for resume, write mode for fresh
             file_mode = 'ab' if resume_from > 0 and response.status_code == 206 else 'wb'
@@ -490,20 +576,24 @@ class TakeoutDownloader:
             
             with open(temp_path, file_mode) as f:
                 for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-                    if self.should_stop:
+                    if self.should_stop or self.auth_failed:
                         # Keep partial file for resume on stop
-                        return False, "stopped"
+                        return False, "STOPPED"
                     
                     if chunk:
+                        if total_size > 0 and downloaded + len(chunk) > total_size:
+                            return False, "Response exceeded the expected archive size"
                         # Check first chunk for archive magic bytes (only on fresh downloads)
                         if downloaded == 0:
                             magic = get_magic_bytes(self.extension)
                             if magic and chunk[:len(magic)] != magic:
-                                temp_path.unlink()
-                                return False, "AUTH_FAILED"
+                                temp_path.unlink(missing_ok=True)
+                                return False, "NOT_ARCHIVE"
                         
                         f.write(chunk)
                         downloaded += len(chunk)
+                        with self._lock:
+                            self.stats.bytes_downloaded += len(chunk)
                         
                         # Progress
                         pct = (downloaded / total_size * 100) if total_size else 0
@@ -511,8 +601,11 @@ class TakeoutDownloader:
             
             print()  # Newline after progress
             
-            # Rename to final
-            temp_path.rename(filepath)
+            if total_size > 0 and downloaded != total_size:
+                return False, "Downloaded size does not match the expected archive size"
+
+            # Move into place (atomic, and works when the target exists on Windows)
+            os.replace(temp_path, filepath)
             
             # Record size for future reference
             self.size_history.record_size(filepath.name, downloaded)
@@ -520,13 +613,19 @@ class TakeoutDownloader:
             return True, ""
             
         except requests.exceptions.HTTPError as e:
-            if e.response and e.response.status_code == 404:
+            if e.response is not None and e.response.status_code == 404:
                 return False, "NOT_FOUND"
             # Keep partial file for resume on network errors
             return False, f"HTTP error: {e}"
         except requests.exceptions.RequestException as e:
             # Keep partial file for resume on network errors
             return False, f"Network error: {e}"
+        except (OSError, ValueError) as e:
+            # Disk full, permission denied, malformed header, ...
+            return False, f"Local error: {e}"
+        finally:
+            if response is not None:
+                response.close()
     
     def prompt_new_curl(self) -> bool:
         """Prompt user for new cURL command. Returns True if successful."""
@@ -587,18 +686,21 @@ class TakeoutDownloader:
         
         while not self.should_stop:
             # Clean up any bad files first
-            print(f"\nChecking for incomplete downloads...")
+            print("\nChecking for incomplete downloads...")
             first_needed = self.cleanup_bad_files()
             
             # Build list of files to download
             to_download = []
+            skipped = 0
             for num in range(first_needed, file_count + 1):
                 filepath = self.get_filepath(num)
                 if filepath.exists() and filepath.stat().st_size > 0:
                     expected = self.size_history.get_expected_size(filepath.name)
                     if not expected or filepath.stat().st_size >= expected:
+                        skipped += 1
                         continue  # Skip existing good files
                 to_download.append(num)
+            self.stats.skipped_files = skipped
             
             if not to_download:
                 print("\nAll files downloaded!")
@@ -617,7 +719,10 @@ class TakeoutDownloader:
                         break
                     
                     filepath = self.get_filepath(num)
-                    success, error = self.download_file(num)
+                    try:
+                        success, error = self.download_file(num)
+                    except Exception as e:
+                        success, error = False, f"Unexpected error: {e}"
                     
                     if success:
                         print(f"✓ {filepath.name}")
@@ -633,10 +738,15 @@ class TakeoutDownloader:
                     elif error == "NOT_FOUND":
                         consecutive_404 += 1
                         print(f"✗ {filepath.name} not found (404)")
+                        with self._lock:
+                            self.stats.not_found_files += 1
                         if consecutive_404 >= 3:
-                            print(f"\n3 consecutive 404s - assuming done")
+                            print("\n3 consecutive 404s - assuming done")
                             self.should_stop = True
                             break
+
+                    elif error == "STOPPED":
+                        break
                             
                     else:
                         print(f"✗ {filepath.name}: {error}")
@@ -672,7 +782,11 @@ class TakeoutDownloader:
                                 
                             elif error == "NOT_FOUND":
                                 print(f"✗ {filepath.name} not found (404)")
-                                # Don't track consecutive 404s in parallel mode
+                                with self._lock:
+                                    self.stats.not_found_files += 1
+
+                            elif error == "STOPPED":
+                                pass
                                 
                             else:
                                 print(f"✗ {filepath.name}: {error}")
@@ -696,10 +810,12 @@ class TakeoutDownloader:
         
         # Summary
         print("\n" + "=" * 60)
-        print(f"✅ Done!")
+        print("✅ Done!")
         print(f"   Completed: {self.stats.completed_files}")
         print(f"   Skipped:   {self.stats.skipped_files}")
+        print(f"   Not found: {self.stats.not_found_files}")
         print(f"   Failed:    {self.stats.failed_files}")
+        print(f"   Downloaded:{self.stats.bytes_downloaded / (1024 * 1024):8.1f} MB")
         print("=" * 60)
         
         return self.stats
@@ -735,8 +851,8 @@ Examples:
     # Web options
     parser.add_argument('--port', type=int, default=5000, 
                        help='Web server port (default: 5000)')
-    parser.add_argument('--host', default='0.0.0.0', 
-                       help='Web server host (default: 0.0.0.0)')
+    parser.add_argument('--host', default='127.0.0.1',
+                       help='Web server host (default: 127.0.0.1; use 0.0.0.0 for LAN access)')
     
     parser.add_argument('--version', '-v', action='version', 
                        version=f'%(prog)s {VERSION}')
@@ -766,7 +882,8 @@ def run_web(host: str, port: int):
     try:
         from google_takeout_web import create_app
         app, socketio = create_app()
-        print(f"\n🌐 Starting web interface on http://{host}:{port}")
+        display_host = 'localhost' if host in ('0.0.0.0', '::') else host
+        print(f"\n🌐 Starting web interface on http://{display_host}:{port}")
         socketio.run(app, host=host, port=port, debug=False, allow_unsafe_werkzeug=True)
     except ImportError as e:
         print(f"Web mode requires Flask: {e}")

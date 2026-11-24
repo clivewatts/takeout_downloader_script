@@ -8,7 +8,7 @@
 
 A simple, robust tool to bulk download Google Takeout archives. Available as **TUI** (Terminal UI) and **Web interface**.
 
-![Version](https://img.shields.io/badge/Version-4.2.0-blue) ![TUI](https://img.shields.io/badge/TUI-Default-green) ![Web](https://img.shields.io/badge/Web-Available-blue) ![Docker](https://img.shields.io/badge/Docker-Ready-2496ED) ![Python](https://img.shields.io/badge/Python-3.8+-blue) ![Platform](https://img.shields.io/badge/Platform-Linux%20|%20Windows%20|%20macOS-orange)
+![Version](https://img.shields.io/badge/Version-4.3.0-blue) ![TUI](https://img.shields.io/badge/TUI-Default-green) ![Web](https://img.shields.io/badge/Web-Available-blue) ![Docker](https://img.shields.io/badge/Docker-Ready-2496ED) ![Python](https://img.shields.io/badge/Python-3.8+-blue) ![Platform](https://img.shields.io/badge/Platform-Linux%20|%20Windows%20|%20macOS-orange)
 
 ## Features
 
@@ -43,9 +43,12 @@ python takeout.py --web
 ### Docker (Web Interface)
 
 ```bash
-docker-compose up -d
-# Open http://localhost:5000
+docker compose up -d
+# Open http://localhost:5001
 ```
+
+Downloads are written to `./downloads` next to `docker-compose.yml`. See
+[Docker](#docker) for ports and volume options.
 
 ## Installation
 
@@ -89,10 +92,15 @@ python takeout.py
 
 ```bash
 python takeout.py --web
-python takeout.py --web --port 8080  # Custom port
+python takeout.py --web --port 8080          # Custom port
+python takeout.py --web --host 0.0.0.0       # Expose on the LAN (no auth!)
 ```
 
 Open `http://localhost:5000` in your browser.
+
+The web server binds to `127.0.0.1` by default. It has **no authentication** and
+accepts an arbitrary output directory, so only bind it to a non-loopback
+address on a trusted network.
 
 ### Command-Line Options
 
@@ -102,7 +110,7 @@ python takeout.py [OPTIONS]
 Options:
   --web           Start web interface instead of TUI
   --port PORT     Web server port (default: 5000)
-  --host HOST     Web server host (default: 0.0.0.0)
+  --host HOST     Web server host (default: 127.0.0.1)
   -v, --version   Show version
 ```
 
@@ -111,25 +119,46 @@ Options:
 ### Using Docker Compose (Recommended)
 
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
-Open `http://localhost:5000`
+Open `http://localhost:5001`
+
+The compose file uses:
+
+- `${DOWNLOADS_DIR:-./downloads}` as the host download directory (created
+  automatically). Set `DOWNLOADS_DIR=/path/to/downloads` to use another folder.
+  Docker Desktop must be allowed to share that path (on macOS, paths under your
+  home directory are shared by default).
+- `${WEB_PORT:-5001}` as the host port, bound to `127.0.0.1`. Port 5000 is used
+  by AirPlay Receiver on macOS, so Docker defaults to 5001.
+
+```bash
+# Examples
+DOWNLOADS_DIR=~/takeout docker compose up -d
+WEB_PORT=8080 docker compose up -d
+```
+
+Follow the logs with `docker compose logs -f`.
 
 ### Manual Docker
 
 ```bash
 docker build -t takeout-downloader .
-docker run -d -p 5000:5000 -v $(pwd)/downloads:/downloads takeout-downloader
+docker run -d -p 127.0.0.1:5001:5000 -v "$(pwd)/downloads:/downloads" takeout-downloader
 ```
+
+Open `http://localhost:5001`.
 
 ### Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `OUTPUT_DIR` | Download directory | `/downloads` |
-| `PARALLEL_DOWNLOADS` | Concurrent downloads | `6` |
-| `FILE_COUNT` | Max files to download | `100` |
+| `OUTPUT_DIR` | Download directory | `/downloads` (Docker) / `./downloads` |
+| `PARALLEL_DOWNLOADS` | Concurrent downloads (1-20) | `6` |
+| `FILE_COUNT` | Max archive parts to look for | `100` |
+| `SECRET_KEY` | Flask session secret | random per start |
+| `CORS_ALLOWED_ORIGINS` | Comma-separated Socket.IO origins | same-origin |
 
 ## Pre-built Binaries
 
@@ -137,19 +166,19 @@ Download the latest release for your platform (no Python required):
 
 | Platform | Download |
 |----------|----------|
-| **Linux** | [takeout-linux-x64](https://github.com/clivewatts/takeout_downloader_script/releases/latest/download/takeout-linux-x64) |
-| **Windows** | [takeout-windows-x64.exe](https://github.com/clivewatts/takeout_downloader_script/releases/latest/download/takeout-windows-x64.exe) |
-| **macOS** | [takeout-macos-x64](https://github.com/clivewatts/takeout_downloader_script/releases/latest/download/takeout-macos-x64) |
+| **Linux** | [Google_Takeout_Downloader-linux-x64](https://github.com/clivewatts/takeout_downloader_script/releases/latest/download/Google_Takeout_Downloader-linux-x64) |
+| **Windows** | [Google_Takeout_Downloader-windows-x64.exe](https://github.com/clivewatts/takeout_downloader_script/releases/latest/download/Google_Takeout_Downloader-windows-x64.exe) |
+| **macOS** | [Google_Takeout_Downloader-macos-x64](https://github.com/clivewatts/takeout_downloader_script/releases/latest/download/Google_Takeout_Downloader-macos-x64) |
 
 ```bash
 # Linux/macOS
-chmod +x takeout-linux-x64
-./takeout-linux-x64              # TUI mode
-./takeout-linux-x64 --web        # Web mode
+chmod +x Google_Takeout_Downloader-linux-x64
+./Google_Takeout_Downloader-linux-x64              # TUI mode
+./Google_Takeout_Downloader-linux-x64 --web        # Web mode
 
 # Windows
-takeout-windows-x64.exe          # TUI mode
-takeout-windows-x64.exe --web    # Web mode
+Google_Takeout_Downloader-windows-x64.exe          # TUI mode
+Google_Takeout_Downloader-windows-x64.exe --web    # Web mode
 ```
 
 ## Building from Source
@@ -189,13 +218,15 @@ Google sessions expire after ~1 hour. When this happens:
 ## Files
 
 ```
-takeout.py           # Main entry point
-google_takeout_tui.py   # TUI interface (textual)
-google_takeout_web.py   # Web interface (Flask)
-requirements.txt     # Python dependencies
-Dockerfile          # Docker image
-docker-compose.yml  # Docker Compose config
-build.py            # Build script for standalone binary
+takeout.py            # Shared download engine + main entry point
+google_takeout_tui.py # TUI interface (textual)
+google_takeout_web.py # Web interface (Flask)
+dedupe_takeout.py     # Find/remove byte-identical archives
+requirements.txt      # Python dependencies
+requirements-dev.txt  # Test/build dependencies
+Dockerfile            # Docker image
+docker-compose.yml    # Docker Compose config
+build.py              # Build script for standalone binary
 ```
 
 ## License

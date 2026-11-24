@@ -8,6 +8,3 @@ rich>=13.0.0
 # Web interface (--web mode)
 flask>=3.0.0
 flask-socketio>=5.3.0
-
-# For building single binary
-pyinstaller>=6.0.0
